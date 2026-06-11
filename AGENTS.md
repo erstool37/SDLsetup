@@ -25,6 +25,7 @@ This workspace is for a WSL-based self-driving lab environment. Robotic arms, mi
 - Before any command that can cause motion, heat, pressure, illumination, fluid flow, sample contact, or instrument state changes, identify the target device and intended action.
 - Prefer dry-run, status, home, idle, simulation, or read-only diagnostics when available.
 - Stop and ask before destructive cleanup, calibration overwrite, firmware changes, or persistent device configuration changes.
+- For xArm work, SDK import checks are allowed, but controller connections, `motion_enable`, `set_mode`, `set_state`, homing, gripper commands, and movement commands require explicit live-hardware approval.
 
 ## Project Layout
 
@@ -32,6 +33,7 @@ This workspace is for a WSL-based self-driving lab environment. Robotic arms, mi
 - Add concrete paths, service names, device maps, runbooks, and experiment structure here as the lab stack becomes real.
 - Do not store secrets, tokens, credentials, private keys, or private calibration data in agent rules.
 - Shared examples should use templates such as `.env.example`, placeholder device IDs, and documented setup steps instead of real credentials.
+- Keep real robot IPs, private calibration values, and operator-specific hardware settings in ignored local files, not committed docs or scripts.
 
 ## Troubleshooting
 

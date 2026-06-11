@@ -7,3 +7,4 @@
 - Confirm coordinate frames, units, workspace bounds, sample clearance, and emergency stop assumptions before motion planning.
 - Never fabricate calibration, homing, kinematic, deck, stage, camera, or safety-limit data.
 - Do not commit private calibration data, proprietary device credentials, controller keys, or user-specific access files.
+- For xArm SDK work, import-only checks are safe by default; controller connections, enabling motion, setting mode/state, homing, gripper control, GPIO, and movement are live-hardware actions.

@@ -12,6 +12,7 @@ Do not commit secrets, runtime state, large datasets, model checkpoints, raw ima
 - Local rules live in `.codex/rules/`.
 - Hardware commands should default to read-only discovery unless the user explicitly approves live action.
 - Use SSH for Git access in multi-user lab setups; see `docs/git-ssh-setup.md`.
+- xArm SDK setup is documented in `docs/xarm-setup.md`; the initial verification is import-only and does not connect to hardware.
 
 ## Repository URL
 

@@ -1,0 +1,1 @@
+xarm-python-sdk==1.18.4
