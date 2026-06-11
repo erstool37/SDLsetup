@@ -1,0 +1,66 @@
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*token*
+*secret*
+auth.json
+
+# Codex runtime state; keep only checked-in rule files
+.codex/*
+!.codex/rules/
+!.codex/rules/*.md
+
+# Python and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Node and frontend tooling
+node_modules/
+dist/
+build/
+.next/
+.vite/
+
+# Logs and local runtime output
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# Lab data and large artifacts
+data/
+datasets/
+results/
+runs/
+artifacts/
+checkpoints/
+models/
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.onnx
+*.tif
+*.tiff
+*.nd2
+*.czi
+*.lif
+*.avi
+*.mp4
+*.mov
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
