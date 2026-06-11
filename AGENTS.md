@@ -18,6 +18,13 @@ This workspace is for a WSL-based self-driving lab environment. Robotic arms, mi
 - Prefer logs, configs, command output, and hardware status checks over guesses.
 - Treat this as a multi-user lab setup. Do not store private keys, personal tokens, passwords, user-specific credentials, or machine-specific secrets in the repository.
 
+## Python Environment
+
+- Use the pyenv virtualenv named `main` for this repository.
+- The repo-local `.python-version` should stay set to `main`.
+- Install Python packages with `python -m pip ...` after confirming `pyenv version` resolves to `main`.
+- Do not create or commit project-local virtualenvs, Conda environments, or user-specific interpreter paths unless explicitly requested.
+
 ## Hardware Safety
 
 - Treat physical hardware as stateful and potentially hazardous.
