@@ -58,13 +58,12 @@ import argparse  # noqa: E402
 import json  # noqa: E402
 
 import numpy as np  # noqa: E402
-from PIL import Image, ImageFilter  # noqa: E402
 
 from tools.arm import Arm, ArmSettings, SafetyError  # noqa: E402
 from tools.arm.driver import ArmError  # noqa: E402
 from tools.arm.safety import Envelope  # noqa: E402
 from tools.arm.workspace import WorkspaceStore  # noqa: E402
-from tools.calib import centering  # noqa: E402
+from tools.calib import adapters, centering  # noqa: E402
 from tools.calib import pixel_scale as ps  # noqa: E402
 from tools.calib import plate_frame as pf  # noqa: E402
 from tools.microscope import Microscope, MicroscopeSettings  # noqa: E402
@@ -72,7 +71,6 @@ from tools.microscope import Microscope, MicroscopeSettings  # noqa: E402
 #: Blur radius, px, used to estimate the illumination field. Must be well above
 #: the dot radius (measured 600 px) so the dot is not blurred into its own
 #: background and erased. 180 px was the value verified on 2026-08-11.
-FLAT_FIELD_BLUR_PX = 180
 
 #: XY half-box around A1. Must admit a 9 mm well step plus centring corrections;
 #: deliberately not larger, so a runaway correction cannot walk off the plate.
@@ -99,84 +97,9 @@ XY_BOX_MM = 14.0
 #: Kept as a knob for a smaller dot; it is not usable for this one.
 CENTRE_KEEP_FRAC = 1.0
 
-FRAME_TIMEOUT_S = 30.0
 
 
-class _FlatFieldCamera:
-    """CameraPort: newest published frame, illumination-corrected.
 
-    Reports pixels. It makes no decision about what the dot is or where the arm
-    should go -- that stays with center_on_dot and this script.
-    """
-
-    def __init__(self, scope: Microscope, out_dir: Path, ordinal: int, tag: str = "f",
-                 keep_frac: float = CENTRE_KEEP_FRAC):
-        self.scope, self.out_dir, self.ordinal = scope, out_dir, ordinal
-        self.tag, self.n = tag, 0
-        self.keep_frac = float(keep_frac)
-
-    def frame(self) -> np.ndarray:
-        self.n += 1
-        dest = self.out_dir / f"{self.tag}_{self.n:03d}.jpg"
-        got = self.scope.grab_frame(dest, ordinal=self.ordinal, timeout_s=FRAME_TIMEOUT_S)
-        if not got.ok:
-            raise SystemExit(f"[scan] ABORT: frame grab failed: {got.reason}")
-        img = Image.open(dest).convert("L")
-        raw = np.asarray(img, dtype=float)
-        bg = np.asarray(img.filter(ImageFilter.GaussianBlur(radius=FLAT_FIELD_BLUR_PX)),
-                        dtype=float)
-        flat = np.clip(raw / np.maximum(bg, 1.0) * 128.0, 0, 255)
-        # Border suppression. Dark structures against the frame edge (well wall
-        # arcs) are not candidates -- the dot we are centring is by definition
-        # the one near the middle, and a competing edge blob makes the loop walk
-        # the real dot out of frame instead of into the centre.
-        if self.keep_frac < 1.0:
-            h, w = flat.shape
-            keep = np.zeros_like(flat, dtype=bool)
-            y0 = int(h * (1 - self.keep_frac) / 2)
-            x0 = int(w * (1 - self.keep_frac) / 2)
-            keep[y0:h - y0, x0:w - x0] = True
-            flat[~keep] = float(np.median(flat[keep]))
-        return flat.astype(np.uint8)
-
-
-class _GuardedArm:
-    """ArmPort backed by the shared guarded Arm. Every move is envelope-checked.
-
-    Z, roll, pitch and yaw are PINNED to the taught anchor rather than echoed
-    back from the pose that was just read. Centring is an XY operation; letting
-    it re-command a measured Z means feeding settling noise back in as a
-    command. The envelope freezes Z to exactly the taught height, so a pose read
-    0.7 um high -- which is what the arm actually reports -- fails validation
-    and aborts the scan. Measured 2026-08-11: z 191.2095 against a window of
-    [191.2088, 191.2088].
-
-    Pinning is the stronger fix than widening the window: it keeps Z frozen at
-    zero budget (raising Z drives the plate toward the objective) while making
-    the commanded value exactly the one the envelope permits.
-    """
-
-    def __init__(self, arm: Arm, anchor: tuple):
-        self.arm = arm
-        self.anchor = anchor
-
-    def get_pose(self) -> list:
-        return list(self.arm.pose())
-
-    def move_cart(self, x, y, z, roll, pitch, yaw, speed) -> None:
-        a = self.anchor
-        self.arm.move_pose((x, y, a[2], a[3], a[4], a[5]), speed=speed,
-                           label="centre", takeup=False)
-
-
-class _Transform:
-    """transform.apply(offset_px) -> (dx_mm, dy_mm), from the measured Jacobian."""
-
-    def __init__(self, J):
-        self.J = J
-
-    def apply(self, offset_px):
-        return ps.correction_mm(self.J, offset_px)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -265,7 +188,7 @@ def run(args) -> int:
                             orient_tol_deg=0.5)
     guarded = robot.with_envelope(env)
     scope = Microscope(MicroscopeSettings.from_config())
-    transform = _Transform(J)
+    transform = adapters.JacobianTransform(J)
 
     measured: dict[str, tuple[float, float]] = {}
     try:
@@ -275,10 +198,11 @@ def run(args) -> int:
             guarded.move_pose((nx, ny, a1[2], a1[3], a1[4], a1[5]),
                               speed=args.speed, label=f"goto {name.strip()}",
                               takeup=False)
-            cam = _FlatFieldCamera(scope, out_dir, args.frame_ordinal,
-                                   tag=name.split()[0], keep_frac=args.centre_keep_frac)
+            cam = adapters.FlatFieldCamera(scope, out_dir,
+                                           ordinal=args.frame_ordinal,
+                                           tag=name.split()[0])
             res = centering.center_on_dot(
-                _GuardedArm(guarded, a1), cam, transform,
+                adapters.PinnedArm(guarded, a1), cam, transform,
                 tolerance_mm=args.tolerance_mm,
                 max_iterations=args.max_iterations,
                 max_correction_mm=args.max_correction_mm,
@@ -326,7 +250,7 @@ def run(args) -> int:
             "jacobian_decomposition": d,
             "note": ("dots are HAND-DRAWN; centring is centroid-based and circle-fit "
                      "quality flags do not apply. Frames flat-fielded "
-                     f"(gaussian r={FLAT_FIELD_BLUR_PX} px) because only ~32% of the "
+                     f"(gaussian r={adapters.FLAT_FIELD_BLUR_PX} px) because only ~32% of "
                      "raw frame is lit and the dot merges with the vignette."),
         }, indent=1))
         print(f"\n  stored: {args.store}")

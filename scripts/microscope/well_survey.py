@@ -39,28 +39,20 @@ import argparse  # noqa: E402
 import json  # noqa: E402
 
 import numpy as np  # noqa: E402
-from PIL import Image, ImageFilter  # noqa: E402
+from PIL import Image  # noqa: E402
 
 from tools.arm import Arm, ArmSettings, SafetyError  # noqa: E402
 from tools.arm.driver import ArmError  # noqa: E402
 from tools.arm.safety import Envelope  # noqa: E402
 from tools.arm.workspace import WorkspaceStore  # noqa: E402
+from tools.calib import adapters, grid  # noqa: E402
 from tools.microscope import Microscope, MicroscopeSettings  # noqa: E402
 
-FLAT_FIELD_BLUR_PX = 180
 FRAME_TIMEOUT_S = 30.0
 #: Reach column 12 (11 steps x 9 mm = 99 mm) plus a little slack, and no more.
 XY_BOX_MM = 105.0
 
 
-def parse_well(name: str) -> tuple[int, int]:
-    """'A1' -> (row 0, col 0); 'B1' -> (1, 0); 'A12' -> (0, 11)."""
-    name = name.strip().upper()
-    row = ord(name[0]) - ord("A")
-    col = int(name[1:]) - 1
-    if not (0 <= row <= 7) or not (0 <= col <= 11):
-        raise SystemExit(f"[survey] {name!r} is not a well on a 96-well plate")
-    return row, col
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,7 +127,7 @@ def run(args) -> int:
         print("calibration: NONE -- using the nominal grid (known 1.37 mm out at A12)")
 
     wells = [w for w in (w.strip() for w in args.wells.split(",")) if w]
-    plan = [(w, *parse_well(w)) for w in wells]
+    plan = [(w, *grid.parse_well(w)) for w in wells]
 
     print(f"taught A1 : x={a1[0]:.4f} y={a1[1]:.4f} z={a1[2]:.4f} yaw={a1[5]:.4f}")
     print(f"pitch     : {pitch} mm   axis_map {amap}")
@@ -181,12 +173,10 @@ def run(args) -> int:
                 print(f"[survey] {w}: frame grab FAILED: {got.reason}")
                 results.append((w, None))
                 continue
-            img = Image.open(dest).convert("L")
-            raw = np.asarray(img, dtype=float)
-            bg = np.asarray(img.filter(ImageFilter.GaussianBlur(radius=FLAT_FIELD_BLUR_PX)),
-                            dtype=float)
-            flat = np.clip(raw / np.maximum(bg, 1.0) * 128.0, 0, 255)
-            Image.fromarray(flat.astype(np.uint8)).save(out_dir / f"{w}_flat.png")
+            img = Image.open(dest)
+            raw = np.asarray(img.convert("L"), dtype=float)
+            flat = adapters.flat_field(img)
+            Image.fromarray(flat).save(out_dir / f"{w}_flat.png")
             dark = float((flat < 90).mean())
             print(f"[survey] {w}: mean={raw.mean():.1f} dark_frac={dark:.3f} -> {dest}")
             results.append((w, dark))

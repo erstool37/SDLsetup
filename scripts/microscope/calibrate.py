@@ -76,7 +76,7 @@ from PIL import Image  # noqa: E402
 from tools.arm import Arm, ArmSettings  # noqa: E402
 from tools.arm.safety import Envelope  # noqa: E402
 from tools.arm.workspace import WorkspaceStore  # noqa: E402
-from tools.calib import adapters, centering  # noqa: E402
+from tools.calib import adapters, centering, grid  # noqa: E402
 from tools.calib import pixel_scale as ps  # noqa: E402
 from tools.microscope import Microscope, MicroscopeSettings  # noqa: E402
 from tools.microscope import imaging as detect  # noqa: E402
@@ -191,13 +191,6 @@ class CalibrationReport:
         return "\n".join([head, body] + tail)
 
 
-def parse_well(name: str) -> tuple[int, int]:
-    name = name.strip().upper()
-    row = ord(name[0]) - ord("A")
-    col = int(name[1:]) - 1
-    if not (0 <= row <= 7 and 0 <= col <= 11):
-        raise ValueError(f"{name!r} is not a well on a 96-well plate")
-    return row, col
 
 
 def _dot_in_frame(flat, px_per_mm: float, tmp: Path | None = None) -> tuple[bool, dict]:
@@ -455,7 +448,7 @@ def calibrate_microscope_position_and_focal_point(
         # ------------------------------------------------------- 4. the grid
         refs: dict[str, tuple[float, float]] = {}
         for well in reference_wells:
-            r, c = parse_well(well)
+            r, c = grid.parse_well(well)
             nx, ny = nominal(r, c)
             # Offset the nominal by A1's own correction so the reference starts
             # from the same place the grid does.
@@ -486,16 +479,16 @@ def calibrate_microscope_position_and_focal_point(
             refs[well] = (p[0], p[1])
             log(f"[cal] {well}: centred x={p[0]:.4f} y={p[1]:.4f}")
 
-        grid = _solve_grid(report.a1_centred, refs, amap, pitch_nom)
-        report.grid = grid
+        grid_model = _solve_grid(report.a1_centred, refs, amap, pitch_nom)
+        report.grid = grid_model
         report.stages.append(StageResult(
-            "grid", grid is not None,
+            "grid", grid_model is not None,
             {"references": ",".join(refs) or "none",
-             "row_axis": (grid or {}).get("row_axis", "n/a")},
+             "row_axis": (grid_model or {}).get("row_axis", "n/a")},
             None if grid else
             "no reference dot could be centred, so the grid is still the nominal "
             "one. Movement to distant wells is unverified."))
-        if grid is None:
+        if grid_model is None:
             return report
 
         # ---------------------------------------------------------- 5. store
@@ -513,7 +506,7 @@ def calibrate_microscope_position_and_focal_point(
                 "taught_a1": list(a1), "a1_centred": list(report.a1_centred),
                 "focus_z": report.focus_z, "references": {k: list(v) for k, v in refs.items()},
                 "jacobian_decomposition": jd,
-                **grid,
+                **grid_model,
             }
             CALIBRATION_JSON.write_text(json.dumps(payload, indent=1))
             report.stored_to = str(CALIBRATION_JSON)
@@ -536,7 +529,7 @@ def _solve_grid(origin, refs: dict, amap: dict, pitch_nom: float) -> dict | None
         return None
     col_vecs, row_vecs = [], []
     for well, p in refs.items():
-        r, c = parse_well(well)
+        r, c = grid.parse_well(well)
         dx, dy = p[0] - origin[0], p[1] - origin[1]
         if c > 0 and r == 0:
             col_vecs.append(((dx / c, dy / c), well))
@@ -589,11 +582,6 @@ def _solve_grid(origin, refs: dict, amap: dict, pitch_nom: float) -> dict | None
     }
 
 
-def well_pose(cal: dict, row: int, col: int) -> tuple[float, float]:
-    """Arm XY for a well, from a stored calibration."""
-    o, c, r = cal["a1_centred"], cal["col_step_mm"], cal["row_step_mm"]
-    return (o[0] + c[0] * col + r[0] * row, o[1] + c[1] * col + r[1] * row)
-
 
 def image_wells(wells: Sequence[str], *, live: bool = False, host: str | None = None,
                 speed: float = 5.0, settle_s: float = 2.0,
@@ -617,9 +605,9 @@ def image_wells(wells: Sequence[str], *, live: bool = False, host: str | None = 
     transform = adapters.JacobianTransform(J)
     px_per_mm = float(ps.decompose(J)["px_per_mm_mean"])
 
-    plan = [(w, *parse_well(w)) for w in wells]
+    plan = [(w, *grid.parse_well(w)) for w in wells]
     for w, r, c in plan:
-        x, y = well_pose(cal, r, c)
+        x, y = grid.measured_xy(cal, r, c)
         log(f"  {w:<4} -> x={x:9.4f} y={y:9.4f}")
     if not live:
         log("[wells] DRY-RUN: nothing moved, nothing captured.")
@@ -638,7 +626,7 @@ def image_wells(wells: Sequence[str], *, live: bool = False, host: str | None = 
     out = []
     try:
         for w, r, c in plan:
-            x, y = well_pose(cal, r, c)
+            x, y = grid.measured_xy(cal, r, c)
             legs = adapters.axis_sequential_to(guarded, a1, x, y, speed=speed, label=f"to {w}")
             time.sleep(settle_s)
             cam = adapters.FlatFieldCamera(scope, out_dir, tag=w)

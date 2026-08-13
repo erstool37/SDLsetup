@@ -47,19 +47,14 @@ import argparse  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
 
-import numpy as np  # noqa: E402
-from PIL import Image, ImageFilter  # noqa: E402
-
 from tools.arm import Arm, ArmSettings, SafetyError  # noqa: E402
 from tools.arm.driver import ArmError  # noqa: E402
 from tools.arm.safety import Envelope  # noqa: E402
 from tools.arm.workspace import WorkspaceStore  # noqa: E402
-from tools.calib import centering  # noqa: E402
+from tools.calib import adapters, centering  # noqa: E402
 from tools.calib import pixel_scale as ps  # noqa: E402
 from tools.microscope import Microscope, MicroscopeSettings  # noqa: E402
 
-FLAT_FIELD_BLUR_PX = 180
-FRAME_TIMEOUT_S = 30.0
 XY_BOX_MM = 105.0
 COL_STEPS_A1_TO_A12 = 11
 
@@ -70,51 +65,7 @@ MAX_ROTATION_DEG = 15.0
 MAX_PITCH_DEVIATION = 0.05          # +/-5% on the 9.0 mm nominal pitch
 
 
-class _FlatFieldCamera:
-    """CameraPort: newest published frame, illumination-corrected. Reports only."""
 
-    def __init__(self, scope, out_dir: Path, ordinal: int, tag: str):
-        self.scope, self.out_dir, self.ordinal, self.tag = scope, out_dir, ordinal, tag
-        self.n = 0
-
-    def frame(self) -> np.ndarray:
-        self.n += 1
-        dest = self.out_dir / f"{self.tag}_{self.n:03d}.jpg"
-        got = self.scope.grab_frame(dest, ordinal=self.ordinal, timeout_s=FRAME_TIMEOUT_S)
-        if not got.ok:
-            raise SystemExit(f"[cal] ABORT: frame grab failed: {got.reason}")
-        img = Image.open(dest).convert("L")
-        raw = np.asarray(img, dtype=float)
-        bg = np.asarray(img.filter(ImageFilter.GaussianBlur(radius=FLAT_FIELD_BLUR_PX)),
-                        dtype=float)
-        return np.clip(raw / np.maximum(bg, 1.0) * 128.0, 0, 255).astype(np.uint8)
-
-
-class _GuardedArm:
-    """ArmPort. Z/orientation pinned to the anchor -- centring is an XY operation.
-
-    Echoing back a measured Z re-commands settling noise: the arm reads 0.7 um
-    above the taught height, and against a zero-budget Z window that aborts.
-    """
-
-    def __init__(self, arm: Arm, anchor: tuple):
-        self.arm, self.anchor = arm, anchor
-
-    def get_pose(self) -> list:
-        return list(self.arm.pose())
-
-    def move_cart(self, x, y, z, roll, pitch, yaw, speed) -> None:
-        a = self.anchor
-        self.arm.move_pose((x, y, a[2], a[3], a[4], a[5]), speed=speed,
-                           label="centre", takeup=False)
-
-
-class _Transform:
-    def __init__(self, J):
-        self.J = J
-
-    def apply(self, offset_px):
-        return ps.correction_mm(self.J, offset_px)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -182,26 +133,15 @@ def run(args) -> int:
                             z_max_rise_mm=0.0, z_min_rise_mm=0.0, orient_tol_deg=0.5)
     guarded = robot.with_envelope(env)
     scope = Microscope(MicroscopeSettings.from_config())
-    transform = _Transform(J)
+    transform = adapters.JacobianTransform(J)
 
     def centre_at(tag: str, tx: float, ty: float) -> tuple[float, float]:
         print(f"\n[cal] === {tag} === driving to x={tx:.4f} y={ty:.4f}", flush=True)
-        # Axis-sequential BY HAND, with Z pinned to the anchor. move_axiswise
-        # builds each leg from the arm's MEASURED pose, so it carries a Z of
-        # 191.2089 into a window of exactly [191.2088, 191.2088] and aborts.
-        # Pinning is the fix rather than widening: Z genuinely must not move
-        # here, and the commanded value should be the taught one, not a reading.
-        here = list(guarded.pose())
-        for leg_x, leg_y, leg in ((tx, here[1], "x"), (tx, ty, "y")):
-            if abs(leg_x - here[0]) < 1e-4 and abs(leg_y - here[1]) < 1e-4:
-                continue
-            guarded.move_pose((leg_x, leg_y, a1[2], a1[3], a1[4], a1[5]),
-                              speed=args.speed, label=f"to {tag} [{leg}]",
-                              takeup=False)
-            here = list(guarded.pose())
-        cam = _FlatFieldCamera(scope, out_dir, 2, tag)
+        adapters.axis_sequential_to(guarded, a1, tx, ty, speed=args.speed,
+                                    label=f"to {tag}")
+        cam = adapters.FlatFieldCamera(scope, out_dir, ordinal=2, tag=tag)
         res = centering.center_on_dot(
-            _GuardedArm(guarded, a1), cam, transform,
+            adapters.PinnedArm(guarded, a1), cam, transform,
             tolerance_mm=args.tolerance_mm, max_iterations=args.max_iterations,
             max_correction_mm=args.max_correction_mm, speed=args.speed)
         pose = list(guarded.pose())
