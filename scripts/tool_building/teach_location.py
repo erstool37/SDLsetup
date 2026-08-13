@@ -47,7 +47,13 @@ from tools.arm import Arm, ArmSettings, SafetyError  # noqa: E402
 from tools.arm.workspace import DEFAULT_STORE  # noqa: E402
 
 Y_STANDOFF_MM = 150.0          # scope_standoff = A1 + (0, -Y_STANDOFF, 0)
-TEACHABLE = ("microscope", "floor", "home")
+#: "uvvis" is the SPECTROstar Nano's plate carrier, taught 2026-08-12 onward.
+#: Its tray is NARROW and SHALLOW compared with the microscope station, so the
+#: gripper must be opened only slightly to enter it -- see Arm.set_opening and
+#: decisions/2026-08-11-bio-gripper-position-mode.md. Unlike "microscope",
+#: teaching it recomputes NOTHING: there is no derived standoff for it yet, and
+#: inventing one before the approach is surveyed would be a guess.
+TEACHABLE = ("microscope", "floor", "home", "uvvis")
 
 
 def build_parser() -> argparse.ArgumentParser:
