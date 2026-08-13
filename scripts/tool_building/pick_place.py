@@ -417,8 +417,16 @@ def run(args: argparse.Namespace) -> int:
     # against it. The joint legs still consult nothing -- joint space has no
     # Cartesian envelope, which is why they use taught angles only.
     known_zs = [store.require_location(n).pose.z for n in TAUGHT]
+    # ASYMMETRIC, deliberately. Raising Z drives the plate toward a FIXED
+    # objective, so the ceiling is the dangerous end and must NOT be enlarged to
+    # paper over settling -- that would make a genuinely-too-high target legal.
+    # The route reaches the ceiling exactly, and the arm reads ~45 nm above the
+    # taught value; that is handled by COMMANDING the taught Z rather than a
+    # measured one (see the pinning in the axis legs), not by moving the limit.
+    # The floor keeps its margin: downward is away from the objective, and the
+    # descent into the tray genuinely needs to reach the taught height.
     z_floor = min(known_zs) - Z_CORRIDOR_MARGIN_MM
-    z_ceiling = max(known_zs) + Z_CORRIDOR_MARGIN_MM
+    z_ceiling = max(known_zs)
     robot = Arm(settings, log=lambda msg: print(msg, flush=True)).free_envelope(
         reason="pick sequence carries the plate home -> floor -> home -> "
                "microscope; the tray legs are axis-sequential Cartesian, the "

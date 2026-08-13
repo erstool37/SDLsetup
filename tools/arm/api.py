@@ -640,6 +640,21 @@ class Arm:
 
         idx = {"x": 0, "y": 1, "z": 2}
         cursor = [here[0], here[1], here[2]]
+
+        # An axis already AT its target is commanded as the TARGET value, not as
+        # the value just measured. Every leg's pose carries all three axes, so a
+        # measured coordinate on a skipped axis would otherwise be fed back as a
+        # command on the axes that DO move.
+        #
+        # That is not hypothetical: the transit travels at exactly the taught
+        # working height, the arm reads ~45 nm above it, and the corridor ceiling
+        # is that taught height -- so the X leg was rejected for a Z it never
+        # meant to request. The corridor is deliberately NOT widened to absorb
+        # this (up is toward the objective, and widening would make a genuinely
+        # too-high target legal); the drift is kept out of the command instead.
+        for axis, k in idx.items():
+            if abs(target[axis] - cursor[k]) <= ARRIVAL_TOL_MM:
+                cursor[k] = target[axis]
         results: list[MoveResult] = []
         for n, axis in enumerate(order, 1):
             k = idx[axis]
@@ -747,15 +762,23 @@ class Arm:
             res = self.move_pose(pose, speed=speed, label=leg, takeup=False)
             results.append(res)
 
-            achieved = getattr(res, "achieved", None)
-            if achieved is not None:
-                gap = max(abs(_ang_diff(pose[3 + i], achieved[3 + i])) for i in range(3))
-                if gap > ARRIVAL_TOL_DEG:
-                    raise SafetyError(
-                        f"rotation {leg!r} did NOT arrive: off by {gap:.4f} deg "
-                        f"(tolerance {ARRIVAL_TOL_DEG}). The controller can accept "
-                        f"a move, travel part of it and report success; the "
-                        f"remaining steps assume a turn that did not happen.")
+            # Verify ALL SIX axes, not just orientation. Under a free envelope
+            # check_readback tests only the Z corridor -- its XY and orientation
+            # branches are guarded by `if self.anchor is not None` -- so a step
+            # that drifted laterally was previously invisible here. That matters
+            # doubly for a rotation: XYZ is captured ONCE before the loop, so an
+            # unnoticed drift makes the NEXT step command the original XYZ
+            # alongside another turn, which is a diagonal translation+rotation,
+            # exactly what the axis-sequential rule forbids.
+            arrival = res.verify()
+            if arrival["moved"] is False:
+                raise SafetyError(
+                    f"rotation {leg!r} did NOT arrive: {arrival['reason']} "
+                    f"(worst axis {arrival['worst_axis']}). The controller can "
+                    f"accept a move, travel part of it and report success; the "
+                    f"remaining steps assume a turn that did not happen, and a "
+                    f"lateral drift here would turn the next step into a "
+                    f"diagonal.")
         return results
 
     def _free_target(self, x: float, y: float, z: float) -> tuple:
@@ -843,7 +866,15 @@ class Arm:
                        "worst_gap_deg": None}
             if self.settings.live:
                 actual = [float(a) for a in self.connection.read_joints()]
-                gaps = [abs(a - t) for a, t in zip(actual, angles, strict=False)]
+                # strict=True: a controller that returns FEWER joints than were
+                # commanded must not have the missing ones silently skipped --
+                # the prefix matching is not evidence the arm arrived.
+                if len(actual) != len(angles):
+                    raise SafetyError(
+                        f"joint move {label!r}: commanded {len(angles)} angles but "
+                        f"read back {len(actual)}. Refusing to judge arrival from "
+                        f"a partial readback.")
+                gaps = [abs(a - t) for a, t in zip(actual, angles, strict=True)]
                 worst = max(range(len(gaps)), key=lambda k: gaps[k]) if gaps else None
                 arrival = {
                     "verified": True,
@@ -1015,16 +1046,27 @@ class Arm:
             reading = self.opening()
             raw = reading.get("mm") if isinstance(reading, dict) else reading
             if raw is not None:
-                opening_mm = float(raw)
-                bottomed = opening_mm <= BIO_POS_MIN_MM + GRIP_EMPTY_MARGIN_MM
+                value = float(raw)
+                # A non-finite reading must stay UNKNOWN. `nan <= threshold` is
+                # False, so without this a NaN jaw position reported itself as
+                # "holding" and authorised a lift.
+                if math.isfinite(value):
+                    opening_mm = value
+                    bottomed = value <= BIO_POS_MIN_MM + GRIP_EMPTY_MARGIN_MM
+                else:
+                    self._log(f"  [gripper] WARNING: jaw position read back as "
+                              f"{value!r}; holding state is UNKNOWN, not assumed good")
         except Exception as exc:                       # noqa: BLE001
             self._log(f"  [gripper] WARNING: could not read jaw position after "
                       f"closing ({exc}); holding state is UNKNOWN, not assumed good")
 
-        if isinstance(result, dict):
-            result = dict(result)
-            result.update(opening_mm=opening_mm, bottomed_out=bottomed,
-                          jaw_min_mm=BIO_POS_MIN_MM)
+        # Always return a mapping. The caller reads bottomed_out unconditionally
+        # before it lifts; a non-dict result previously raised AttributeError
+        # outside the (ArmError, SafetyError) handler, losing the controlled
+        # abort this check exists to provide.
+        result = dict(result) if isinstance(result, dict) else {"bio_result": result}
+        result.update(opening_mm=opening_mm, bottomed_out=bottomed,
+                      jaw_min_mm=BIO_POS_MIN_MM)
         if opening_mm is not None:
             self._log(f"  [gripper] jaws at {opening_mm:.1f} mm "
                       f"(min {BIO_POS_MIN_MM:.1f}) -- "

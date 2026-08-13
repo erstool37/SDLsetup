@@ -191,6 +191,24 @@ class FakeRotArm:
 
         class R:
             target = tuple(pose)
+
+            @staticmethod
+            def verify(tol_mm=ARRIVAL_TOL_MM, tol_deg=ARRIVAL_TOL_DEG):
+                # Same contract as MoveResult.verify: compare ACHIEVED against
+                # TARGET on all six axes, mm for xyz and deg for rpy. The
+                # rotation path relies on this to catch a lateral drift, which
+                # check_readback cannot see under a free envelope.
+                worst_axis, worst_gap, over = None, 0.0, False
+                for i in range(6):
+                    tol = tol_mm if i < 3 else tol_deg
+                    gap = abs(float(achieved[i]) - float(pose[i]))
+                    if gap > tol:
+                        over = True
+                    if gap > worst_gap:
+                        worst_axis, worst_gap = i, gap
+                return {"moved": not over, "worst_axis": worst_axis,
+                        "worst_gap": worst_gap,
+                        "reason": "worst gap %.4f" % worst_gap}
         R.achieved = achieved
         return R
 
@@ -278,31 +296,54 @@ except SafetyError:
     ok(True, "a zero-margin corridor rejects the height it operates at",
        "45 nm over the ceiling aborts the run -- this is the 2026-08-11 bug")
 
-# -- 15. the margin admits it, and still bounds the sweep --------------------
-margined = Envelope.free(reason="regression: corridor with settling margin",
-                         z_floor_mm=TAUGHT_FLOOR - Z_CORRIDOR_MARGIN_MM,
-                         z_ceiling_mm=TAUGHT_CEIL + Z_CORRIDOR_MARGIN_MM)
+# -- 15. the corridor is ASYMMETRIC: margin on the floor, none on the ceiling
+# Codex review 2026-08-12: a ceiling margin enlarges the commandable envelope in
+# the DANGEROUS direction (up is toward the fixed objective), making a genuinely
+# too-high target legal. Settling at the ceiling is handled by commanding the
+# TAUGHT Z instead of a measured one, not by moving the limit.
+asym = Envelope.free(reason="policy: floor margin only",
+                     z_floor_mm=TAUGHT_FLOOR - Z_CORRIDOR_MARGIN_MM,
+                     z_ceiling_mm=TAUGHT_CEIL)
 try:
-    margined.check_target((0.0, 0.0, SETTLED_Z, 179.995, -0.003, 89.985),
-                          what="settled at the ceiling")
-    ok(True, "the margined corridor admits the working height plus settling",
-       "%.4f mm margin" % Z_CORRIDOR_MARGIN_MM)
+    asym.check_target((0.0, 0.0, TAUGHT_CEIL, 179.995, -0.003, 89.985),
+                      what="commanded at the taught ceiling")
+    ok(True, "the taught working height itself is commandable")
 except SafetyError as exc:
-    ok(False, "the margined corridor admits the working height plus settling",
+    ok(False, "the taught working height itself is commandable", str(exc)[:70])
+
+try:
+    asym.check_target((0.0, 0.0, SETTLED_Z, 179.995, -0.003, 89.985),
+                      what="45 nm above the ceiling")
+    ok(False, "a target ABOVE the taught ceiling is refused, even by 45 nm")
+except SafetyError:
+    ok(True, "a target ABOVE the taught ceiling is refused, even by 45 nm",
+       "up is toward the objective; pin the commanded Z instead of widening")
+
+# -- 16. the floor margin still lets the tray be reached ---------------------
+try:
+    asym.check_target((0.0, 0.0, TAUGHT_FLOOR - 0.0001, 179.995, -0.003, 89.985),
+                      what="settled at the tray")
+    ok(True, "the floor margin admits the taught tray height plus settling",
+       "%.2f mm, away from the objective" % Z_CORRIDOR_MARGIN_MM)
+except SafetyError as exc:
+    ok(False, "the floor margin admits the taught tray height plus settling",
        str(exc)[:70])
 
-# -- 16. the margin is settling-sized, not a licence to climb ----------------
 ok(0.0 < Z_CORRIDOR_MARGIN_MM <= 1.0,
-   "the corridor margin covers settling only, far below the 10 mm sweep rise",
-   "%.2f mm margin vs 10.0 mm Z_MAX_RISE" % Z_CORRIDOR_MARGIN_MM)
+   "the floor margin covers settling only",
+   "%.2f mm" % Z_CORRIDOR_MARGIN_MM)
 
-try:
-    margined.check_target((0.0, 0.0, TAUGHT_CEIL + 5.0, 179.995, -0.003, 89.985),
-                          what="5 mm above the ceiling")
-    ok(False, "the margined corridor still refuses a real climb toward the lens")
-except SafetyError:
-    ok(True, "the margined corridor still refuses a real climb toward the lens",
-       "+5 mm rejected")
+# -- 17. a skipped axis is commanded as its TARGET, never as a reading -------
+# The transit travels at the taught ceiling and the arm reads 45 nm above it.
+# If that reading is carried into the legs that DO move, the move is rejected
+# for a Z it never meant to request.
+DRIFT = [366.562, 0.423, 61.372 + 0.000045, 180.0, 0.0, 0.0]
+f6 = FakeArm(DRIFT)
+run_axiswise(f6, 400.0, 0.423, 61.372, speed=10.0, order="xyz")
+zs = {round(leg["target"][2], 9) for leg in f6.legs}
+ok(zs == {61.372},
+   "a skipped axis is commanded at its target, not at the measured drift",
+   "commanded z values: %s" % sorted(zs))
 
 print()
 print("%d failure(s)" % failures if failures else "all checks passed")
