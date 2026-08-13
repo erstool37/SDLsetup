@@ -72,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--settle", type=float, default=2.0)
     p.add_argument("--frame-ordinal", type=int, default=2)
     p.add_argument("--out-dir", default="/home/lamp/SDLsetup/dataset/captures/well_survey")
+    p.add_argument("--calibration",
+                   default="/home/lamp/.sdl_lab/robot_arm/well_calibration.json",
+                   help="use the MEASURED column step from this file instead of the "
+                        "nominal axis. Pass '' to force nominal.")
     return p
 
 
@@ -102,6 +106,33 @@ def run(args) -> int:
         else:
             y += dr
         return x, y
+
+    # Prefer the MEASURED column axis. The nominal grid was 1.3686 mm out at
+    # A12 on 2026-08-11 -- three quarters of a field-of-view height, i.e. the
+    # difference between imaging the dot and imaging the well wall.
+    cal = None
+    if args.calibration:
+        try:
+            cal = json.load(open(args.calibration))
+        except OSError:
+            cal = None
+    if cal:
+        origin = cal["a1_centred"]
+        cstep = cal["col_step_mm"]
+        rstep = cal.get("row_step_mm") or [0.0, pitch]
+        print(f"calibration: {args.calibration}")
+        print(f"  origin (A1 centred)  x={origin[0]:.4f} y={origin[1]:.4f}")
+        print(f"  MEASURED column step ({cstep[0]:+.4f}, {cstep[1]:+.4f}) mm  "
+              f"pitch {cal.get('col_pitch_mm', float('nan')):.4f}, "
+              f"rotation {cal.get('col_rotation_deg', float('nan')):+.4f} deg")
+        print(f"  row step is {cal.get('row_axis', 'unknown')} -> "
+              f"({rstep[0]:+.4f}, {rstep[1]:+.4f}) mm")
+
+        def nominal(row: int, col: int) -> tuple[float, float]:   # noqa: F811
+            return (origin[0] + cstep[0] * col + rstep[0] * row,
+                    origin[1] + cstep[1] * col + rstep[1] * row)
+    else:
+        print("calibration: NONE -- using the nominal grid (known 1.37 mm out at A12)")
 
     wells = [w for w in (w.strip() for w in args.wells.split(",")) if w]
     plan = [(w, *parse_well(w)) for w in wells]
