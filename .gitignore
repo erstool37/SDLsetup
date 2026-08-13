@@ -16,6 +16,8 @@ auth.json
 
 # Python and tooling
 __pycache__/
+*.egg-info/
+.ruff_cache/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
@@ -38,12 +40,29 @@ tmp/
 temp/
 .cache/
 
+# Agent worktrees
+.claude/worktrees/
+
+# Collected run data. dataset/ also carries its own .gitignore.
+dataset/
+
+# Measured test fixtures (images). The tests that use them skip loudly
+# when absent -- see dev/tests/fixtures/README.md.
+dev/tests/fixtures/*
+!dev/tests/fixtures/README.md
+
 # Lab data and large artifacts
+#   Collected run data lives OUTSIDE the repo (config.yaml -> data.root,
+#   default ~/sdl_data/runs) and carries its own .gitignore. These entries
+#   catch anything that lands here by accident.
 data/
 datasets/
 results/
 runs/
 artifacts/
+test/images/*
+!test/images/.gitkeep
+!test/images/README.md
 checkpoints/
 models/
 *.h5
@@ -63,4 +82,3 @@ models/
 *.tar
 *.tar.gz
 *.7z
-

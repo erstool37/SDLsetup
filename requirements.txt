@@ -1,1 +1,24 @@
+# Runtime dependencies for the SDL lab control layer.
+#
+#   ~/.pyenv/bin/pyenv exec python -m pip install -r requirements.txt
+#
+# The phase scripts at the repo root import `tools/` directly, so no install of
+# this project itself is needed -- only these third-party packages.
+
+# Robot arm. Pinned: 1.18.4 is the version the BIO Gripper G2 open/close API
+# was verified against; older releases lack set_bio_gripper_*.
 xarm-python-sdk==1.18.4
+
+# Vision: focus metrics, marker detection, phase correlation, image IO.
+numpy>=1.26
+opencv-python-headless>=4.9
+Pillow>=10.0
+
+# Windows-side camera backends (tools/scope/backends/) additionally need
+# `harvesters` (Leica GenTL) and `twain` (Leica TWAIN). Those run under the
+# WINDOWS Python interpreter, not this one, and are installed there -- do not
+# add them here or the WSL install will fail.
+
+# Linting and the test suites live in dev/ and are not needed to run a phase:
+#   pip install ruff==0.15.18
+#   dev/lint.sh ; dev/test.sh

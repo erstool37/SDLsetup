@@ -1,0 +1,21 @@
+{
+  "host": "192.168.1.201",
+  "mac": "04-2b-58-25-d4-99",
+  "pc_nic": "192.168.1.150",
+  "topology": "Isolated unmanaged switch: PC wired NIC (192.168.1.150) <-> xArm control box (192.168.1.201). No internet uplink.",
+  "gripper": {
+    "type": "bio",
+    "model": "UFACTORY BIO Gripper G2",
+    "open_speed": 2000,
+    "close_speed": 1000,
+    "position_speed": 2000,
+    "grip_force": 100,
+    "control_mode": 0,
+    "range_mm": "71-150",
+    "max_force_N": 20,
+    "note": "UFACTORY BIO Gripper G2 over Modbus (RS-485), SDK 1.18.4. Two control modes, register 0x010A, PERSISTENT ACROSS POWER CYCLES. control_mode 0 = open/close: no position servo, the firmware reads a commanded position only as a threshold (>90 opens fully, <=90 closes fully). control_mode 1 = position mode: set_bio_gripper_g2_position(pos_mm, speed, force) drives any span in 71-150 mm, get_bio_gripper_g2_position() reads it back. Speed 500-4000 on the position path, force 1-100 percent of 20 N. open_bio_gripper / close_bio_gripper are the 150 mm and 71 mm endpoints of that same axis; in mode 1 they are expected to still work, via the SDK's legacy 0x0700 register path which converts mm to encoder counts, but that is inference from the SDK source and has never been observed on this hardware - only mode 0 has ever run here. Both jaws move together about the tool axis: one position register, no per-jaw command. Reversing the fingers mechanically gives a 4-83 mm span instead.",
+    "history": "Migrated from the legacy standard-gripper API (set_gripper_*) to the BIO Gripper G2 API on 2026-06-30. Until 2026-08-11 this file recorded that SDK 1.18.4 had no position setpoint; that was wrong, and the cause was the control mode, not the API. Position control is reachable under BOTH names: set_bio_gripper_g2_position, and set_bio_gripper_position which XArmAPI aliases to it via __attr_alias_map / __getattr__ (xarm/wrapper/xarm_api.py:107) - so a probe under either name would have been accepted. What made it look unsupported is that the gripper sat in control_mode 0, where the firmware reads a commanded position only as a threshold: the call returns 0 and the jaws go fully open or fully closed, which is indistinguishable from 'position control is not supported'."
+  },
+  "safety": "Gripper-only control. Scripts here NEVER command arm motion (no set_position / set_servo_angle / move_*). Arm body stays put; only the gripper fingers actuate.",
+  "notes": "xArm Python SDK 1.18.4 in pyenv main. Repo robot_arm CLI is dry-run only; this config plus `python -m tools.arm gripper` are the live gripper path."
+}

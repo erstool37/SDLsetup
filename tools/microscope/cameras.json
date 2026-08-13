@@ -1,0 +1,62 @@
+{
+  "output_dir": "/home/lamp/SDLsetup/dataset/captures",
+  "cameras": {
+    "tis_dfk33ux264": {
+      "enabled": false,
+      "type": "tisgrabber_legacy",
+      "label": "The Imaging Source DFK 33UX264",
+      "device_id": "48424295",
+      "vid_pid": "199e:9089",
+      "usbipd_busid": "1-20",
+      "ic4_ctrl": "/mnt/c/Program Files/The Imaging Source Europe GmbH/ic4/bin/ic4-ctrl.exe",
+      "sample_dir": "/mnt/c/Users/Public/MicroscopeAutomationTransfer/code/HorizontalPython/tisgrabber/samples",
+      "format": "jpg",
+      "jpeg_quality": 90,
+      "snap_timeout_ms": 5000,
+      "show_live": false,
+      "settle_s": 5,
+      "timeout_s": 45,
+      "legacy_unique_name": "DFK 33UX264 48424295",
+      "legacy_exposure_s": 2.0,
+      "legacy_gain": 48.0,
+      "legacy_brightness": 240,
+      "post_capture_props": {
+        "ExposureAuto": "Continuous",
+        "GainAuto": "Continuous"
+      },
+      "notes": "Uses the legacy publication-era TIS stack: tisgrabber_x64.dll, device.xml, IC_StartLive, IC_SnapImage, and IC_SaveImage. During the grabber session it applies the current manual exp2 profile, records legacy Exposure/Gain properties, then restores auto exposure/gain through ic4-ctrl."
+    },
+    "leica_k3c": {
+      "type": "external_command",
+      "label": "Leica K3C",
+      "vid_pid": "1711:1460",
+      "usbipd_busid": "1-19",
+      "enabled": true,
+      "format": "jpg",
+      "timeout_s": 90,
+      "notes": "Uses the Leica K3C USB3 Vision GenTL producer directly through Windows Python. LAS X is not required; close LAS X/LCS if it is holding the K3C exclusively.",
+      "command": [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "{tool_dir_win}\\leica_gentl_capture.ps1",
+        "-Action",
+        "capture",
+        "-Output",
+        "{output_win}",
+        "-OnlineOutput",
+        "{output_dir_win}\\vertical_online_image.jpg",
+        "-ExposureUs",
+        "60000",
+        "-Gain",
+        "1.0",
+        "-TimeoutMs",
+        "5000",
+        "-Quality",
+        "95"
+      ]
+    }
+  }
+}

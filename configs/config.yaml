@@ -1,0 +1,163 @@
+# Root runtime controls for the SDL lab.
+#
+# Three kinds of configuration, kept apart on purpose:
+#   hardware inventory  -> tools/<device>/*.json   (changes when the hardware is
+#                          rewired)
+#   runtime controls    -> this file                             (changes per run)
+#   taught state        -> ~/.sdl_lab/robot_arm/*.json           (changes when
+#                          calibration is re-run)
+#
+# Precedence, highest first: CLI flag / call argument > this file > the device's
+# inventory JSON > the code default. A value here that cannot be parsed is an
+# error -- it never falls through to a laxer default.
+
+camera_config: tools/microscope/cameras.json
+output_dir: /home/lamp/SDLsetup/dataset/captures
+
+capture:
+  camera: all
+  format: jpg
+  start_timeout_s: 5.0
+
+schedule:
+  camera: all
+  interval_s: 30.0
+  format: jpg
+  start_timeout_s: 5.0
+
+autoshoot:
+  camera: all
+  interval_s: 30.0
+  format: jpg
+  batch_prefix: autoshoot
+  start_timeout_s: 5.0
+
+live_session:
+  camera: all
+  format: jpg
+  stream_dir: /tmp/sdl_microscope_stream
+  user_saved_dir: /home/lamp/SDLsetup/dataset/captures/user-saved
+  # Target seconds between live capture starts. Actual rate is driver/camera limited.
+  stream_interval_s: 3.0
+  save_interval_s: 31.0
+  save_prefix: live_save
+  refresh_ms: 500
+  stream_settle_s: 0.0
+  stream_snap_timeout_ms: 3000
+  start_timeout_s: 5.0
+  host: 0.0.0.0
+  port: 8766
+  no_archive: false
+  save_on_start: false
+  quiet: false
+
+monitor:
+  output_dir: /home/lamp/SDLsetup/dataset/captures
+  user_saved_dir: /home/lamp/SDLsetup/dataset/captures/user-saved
+  host: 127.0.0.1
+  port: 8765
+  refresh_ms: 2000
+
+stream:
+  camera: tis_dfk33ux264
+  host: 0.0.0.0
+  port: 8765
+  interval_s: 0.1
+  timeout_ms: 1000
+
+
+uv_vis:
+  # BMG LABTECH SPECTROstar Nano (serial 0601-003639, VS70 spectrometer).
+  # Service name MUST be the underscore form -- see nodes/uv_vis/README.md.
+  reader: SPECTROstar_Nano
+  # Master motion gate. Carrier moves and measurements are refused while false.
+  allow_motion: false
+  # Also require the robot-arm handshake before any carrier motion:
+  # interlock.set_arm_clear(True) / set_plate_loaded(True).
+  require_interlock: true
+  timeout_s: 240.0
+  plate: 96
+  # Wells to use: "all", a block "A1:H12", or a list "A1,B2,C3".
+  wells: all
+  log_dir: /home/lamp/SDLsetup/dataset/uv_vis_runs
+  export_dir: /mnt/c/Program Files (x86)/BMG/SPECTROstar Nano/User/Data
+  assays:
+    # protocol: names a protocol authored in the BMG control software.
+    # Leave empty until it exists there -- this layer selects, never defines.
+    a280:
+      protocol: 
+      wavelength_nm: 280
+      model: linear
+    bca:
+      protocol: 
+      wavelength_nm: 562
+      model: quadratic
+    bradford:
+      protocol: 
+      wavelength_nm: 595
+      model: linear
+    turbidity:
+      protocol: 
+      wavelength_nm: 350
+      model: linear
+
+
+arm:
+  # UFACTORY xArm7 + BIO Gripper G2. Inventory (host, wiring, gripper model)
+  # lives in src/sdlsetup/devices/arm/arm.json; these are the run controls.
+
+  # Master motion gate. False (the default) makes every move a validated,
+  # printed dry-run plan that never reaches the controller.
+  allow_motion: false
+
+  # The taught location every safety envelope is built around. On this rig the
+  # plate is carried under a fixed objective, so "microscope" IS well A1.
+  anchor: microscope
+
+  # anchored -> XY box + Z budget around the anchor (the safe default).
+  # workspace -> no XY box; requires z_floor_mm and z_ceiling_mm below.
+  envelope_kind: anchored
+
+  # Operator's hard limit: raising Z drives the plate TOWARD the objective.
+  z_max_rise_mm: 10.0
+  # Closed-loop re-centring box around the anchor.
+  xy_max_mm: 2.5
+  orient_tol_deg: 0.5
+
+  speed_mm_s: 10.0
+  # TWO CAPS, because they answer different questions.
+  #   speed_max_mm_s          fine positioning under the objective -- an approach
+  #                           leg at 100 mm/s is a lunge into a lens.
+  #   transit_speed_max_mm_s  carrying the plate across the workspace (floor pick
+  #                           <-> standoff <-> scope), nowhere near the lens.
+  # An anchored envelope gets the first; Envelope.free() gets the second.
+  speed_max_mm_s: 30.0
+  transit_speed_max_mm_s: 100.0
+  # Approach every Z from below so backlash is taken up the same way each time.
+  backlash_takeup_mm: 0.3
+
+microscope:
+  # Which camera looks through the objective -- the one focus and centring
+  # measure. The other is the overview camera.
+  objective_camera: leica
+  # Frames published AFTER a request, of which to take the n-th. The stream's
+  # mtime is publish time, not exposure time: publishing runs ~3.0 s apart while
+  # a capture takes ~2 s, so the first frame after a move may predate it.
+  frame_ordinal: 2
+  grab_timeout_s: 25.0
+  focus_method: tenengrad
+  focus_min_mean: 30.0
+  # Score the lit sample and the marker's edge, not the whole frame. Full-frame
+  # scoring is dominated by the unlit vignette and was measured wrong here.
+  focus_masked: true
+
+data:
+  # Every run collects into <root>/<YYYY-MM-DD>/<HHMMSS>-<phase>/ with one
+  # sub-folder per device, that device's own log, the run transcript, and a
+  # manifest recording how to regenerate it. See tools/runs.py.
+  #
+  # Default is dataset/ beside the phase scripts; dataset/.gitignore excludes
+  # every byte of it, so the data lives next to the code without ever being
+  # committed. Point this elsewhere (an external disk, say) if it outgrows the
+  # machine.
+  root: dataset

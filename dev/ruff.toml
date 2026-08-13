@@ -1,0 +1,43 @@
+# Lint configuration. Run it with dev/lint.sh (which points ruff here).
+#
+# ruff is a linter: it reads the code without running it and finds what is
+# syntactically valid but breaks on execution. In this repo it has already
+# caught three real crashes that --help smoke tests and the import sweep both
+# missed -- undefined names inside functions that only run mid-procedure,
+# including one in the branch that writes the aligned pose back to
+# workspace.json. Python only resolves names inside a function when that
+# function is called, so an unrun branch stays silent until it matters.
+
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+
+# Each of these is a deliberate decision, not a ratchet loosened to reach green.
+# Re-enabling one is fine; do it as its own change so the diff is reviewable.
+ignore = [
+  # UP031 percent-format. 241 occurrences, and the style is consistent across
+  # the whole codebase -- every operator-facing print uses it. Rewriting them
+  # would touch ~240 lines of motion and capture code for a cosmetic gain. The
+  # style is not deprecated.
+  "UP031",
+  # UP017 (datetime.UTC) and UP007 (`X | Y`) rewrite constructs evaluated AT
+  # IMPORT here -- a module-level constant and two runtime type aliases -- not
+  # just annotations under `from __future__ import annotations`. Both modern
+  # spellings are 3.10/3.11+ only, so applying them turns a cosmetic lint into
+  # a hard ImportError the moment the tree is opened on an older interpreter.
+  # datetime.timezone.utc and typing.Union are not deprecated and cost nothing.
+  # (Learned twice, the second time by breaking every uvvis import.)
+  "UP017",
+  "UP007",
+]
+
+[lint.per-file-ignores]
+# The dashboard page is one big embedded HTML/CSS/JS string; wrapping it would
+# make the markup harder to read, not easier.
+"dashboard/page.py" = ["E501"]
+# Test files are executable scripts with deliberately compact assertion lines.
+"dev/tests/*.py" = ["E501", "E701", "E702"]
+# Vendor bridge programs run under Windows Python and mirror vendor sample code.
+"tools/microscope/backends/*.py" = ["E501"]
