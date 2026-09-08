@@ -80,6 +80,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -132,6 +133,43 @@ NATIVE_DIAGNOSTICS: tuple[tuple[str, str, int | None], ...] = (
 
 _DIAG_TODO = ("TODO(operator): confirm via CLICK Address Picker with "
               '"Display MODBUS Address" checked')
+
+
+def _require_bool(name: str, value: Any, *, error: type = SafetyError) -> bool:
+    """Validate, never coerce: a flag must be a REAL bool.
+
+    S1/S3 class: ``bool`` is a subclass of ``int``, so ``bool("false")`` is
+    ``True`` and ``bool(0.0)`` is ``False`` -- both plausible-looking gate states
+    a typo would produce. Anything that is not literally ``True``/``False`` is
+    refused rather than run through ``bool()``.
+    """
+    if not isinstance(value, bool):
+        raise error(
+            "%s must be a real bool (True/False), got %s %r; refusing to coerce "
+            "-- every non-empty string is truthy, so bool(%r) would silently pick "
+            "a gate state the caller never wrote"
+            % (name, type(value).__name__, value, value))
+    return value
+
+
+def _require_finite(name: str, value: Any, *, positive: bool = False,
+                    non_negative: bool = False, error: type = SafetyError) -> float:
+    """Validate a finite real number; reject bool, non-numbers, NaN and inf.
+
+    S2 class: ``NaN <= 0`` and ``inf <= 0`` are both ``False``, so a bound-only
+    check lets a malformed duration through to mis-time a socket or disable a
+    watchdog. Mirrors the circulator settings' discipline.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value):
+        raise error("%s must be a finite number, got %s %r"
+                    % (name, type(value).__name__, value))
+    number = float(value)
+    if positive and number <= 0.0:
+        raise error("%s must be positive, got %r" % (name, value))
+    if non_negative and number < 0.0:
+        raise error("%s must not be negative, got %r" % (name, value))
+    return number
 
 
 def _publish_path() -> Path:
@@ -242,32 +280,30 @@ class PlcSettings:
         if not isinstance(self.host, str) or not self.host.strip():
             raise _config.ConfigError(
                 "environment.host must be a non-empty string, got %r" % (self.host,))
-        for name in ("port", "device_id"):
+        # S2: retries joins port/device_id as a non-negative int; a NaN would
+        # otherwise pass `< 0` (NaN < 0 is False) with no isinstance guard.
+        for name in ("port", "device_id", "retries"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise _config.ConfigError(
                     "environment.%s must be a non-negative integer, got %r"
                     % (name, value))
-        if self.timeout_s <= 0.0:
-            raise _config.ConfigError(
-                "environment.timeout_s must be positive, got %r" % (self.timeout_s,))
-        if self.retries < 0:
-            raise _config.ConfigError(
-                "environment.retries must not be negative, got %r" % (self.retries,))
-        # G3: config parsing yields real bools, but plain construction does not.
-        # A truthy non-bool (e.g. the string "false") would open the actuation
-        # gate, so require a real bool here too.
+        # S2: durations required FINITE and positive, not merely > 0. NaN/inf pass
+        # a bare `<= 0` check and then mis-time a socket or a watchdog. Routed
+        # through the shared validator so every numeric field added later
+        # inherits the finite check, mirroring the circulator settings.
+        _require_finite("environment.timeout_s", self.timeout_s,
+                        positive=True, error=_config.ConfigError)
+        _require_finite("environment.relay_period_s", self.relay_period_s,
+                        positive=True, error=_config.ConfigError)
+        _require_finite("environment.plc_stale_s", self.plc_stale_s,
+                        positive=True, error=_config.ConfigError)
+        # G3/S-class: config parsing yields real bools, plain construction does
+        # not. A truthy non-bool (e.g. the string "false") would open the
+        # actuation gate, so require a real bool -- validate, never coerce.
         for _flag_name in ("allow_actuation", "dashboard_poll_plc"):
-            _flag = getattr(self, _flag_name)
-            if not isinstance(_flag, bool):
-                raise _config.ConfigError(
-                    "environment.%s must be a real bool, got %r; never "
-                    "truthiness -- every non-empty string is truthy, so a typo "
-                    "would switch a gate ON" % (_flag_name, _flag))
-        if self.plc_stale_s <= 0.0 or self.relay_period_s <= 0.0:
-            raise _config.ConfigError(
-                "environment.relay_period_s and plc_stale_s must be positive, got "
-                "%r and %r" % (self.relay_period_s, self.plc_stale_s))
+            _require_bool("environment.%s" % _flag_name,
+                          getattr(self, _flag_name), error=_config.ConfigError)
         if self.plc_stale_s < self.relay_period_s:
             raise _config.ConfigError(
                 "environment.plc_stale_s (%r) is below relay_period_s (%r); the "
@@ -621,9 +657,12 @@ class PlcClient:
         # G7: the int() conversion is INSIDE the read guard. A malformed payload
         # (a non-integer register word) is a failed read (read_ok False), not an
         # exception that escapes read_block past every caller's guard.
+        # S5: int(float("inf")) raises OverflowError and int(float("nan")) raises
+        # ValueError; both must fail the read CLOSED (read_ok False), never escape
+        # read_block past every caller's guard as an uncaught exception.
         try:
             return [int(word) for word in words]
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             self.last_error = ("read_holding_registers(%d, count=%d): non-integer "
                                "register in payload %r: %s"
                                % (address, count, words, exc))
@@ -651,7 +690,20 @@ class PlcClient:
             self.last_error = "read_coils(%d): response carried no bits: %r" % (
                 registers.C1_COIL, result)
             return None
-        return bool(bits[0])
+        # S3: require a GENUINE bool (or the ints 0/1). A malformed truthy value
+        # (a string, a stray int like 2) must NOT read as PID-enabled: that fails
+        # OPEN (the relay would keep forwarding). An unreliable coil read is
+        # UNKNOWN, so return None -- which the relay's H1 path fails closed on.
+        # Never coerce a malformed value to True.
+        bit = bits[0]
+        if bit is True or bit is False:
+            return bit
+        if isinstance(bit, int) and bit in (0, 1):
+            return bool(bit)
+        self.last_error = ("read_coils(%d): coil bit %r (%s) is not a genuine "
+                           "bool; the read is unreliable and reported as unknown"
+                           % (registers.C1_COIL, bit, type(bit).__name__))
+        return None
 
     @staticmethod
     def _is_error(result: Any) -> bool:
@@ -684,6 +736,8 @@ class PlcClient:
                 "with SetpointLimits.validate(field, value) -- passing a bare "
                 "number would put an unbounded setpoint on the wire, which is "
                 "the defect this type exists to prevent." % type(sp).__name__)
+
+        dry_run = _require_bool("dry_run", dry_run)  # S-class: validate, never coerce
 
         # F2b: the token proves *a* bound ran, not that it ran against THIS
         # client's limits or targets a canonical register. Re-validate at the
@@ -780,7 +834,10 @@ class PlcClient:
         ``ok=False`` with the error, not raised, so an abort path is not itself
         aborted by a dead socket.
         """
-        want = bool(enabled)
+        # S1: validate, never coerce. bool("false") is True, which would ENABLE
+        # C1; and a dry run of a wrong-typed value is refused too.
+        want = _require_bool("enabled", enabled)
+        dry_run = _require_bool("dry_run", dry_run)
         if dry_run:
             return WriteResult(outcome=PLANNED, address=registers.C1_COIL,
                                values=(1 if want else 0,),

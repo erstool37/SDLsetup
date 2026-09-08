@@ -121,6 +121,23 @@ DEFAULT_CIRC_STALE_S = 5.0
 
 _MISSING = object()
 
+#: S4: a private, unmistakably-OURS marker stamped on every exception whose
+#: fail-safe has already run inside the guarded region. ``Relay.step`` treats an
+#: exception as already-safe ONLY when it carries this marker -- never merely
+#: because it has a ``.record`` attribute, which an injected dependency's
+#: unrelated exception could carry and thereby skip the abort path.
+_RELAY_SAFE_RAN = "_relay_safe_ran"
+
+
+def _mark_safe_ran(exc: BaseException, record: RelayRecord) -> None:
+    """Stamp ``exc`` as one whose fail-safe already ran, attaching ``record``.
+
+    Sets both the public ``.record`` (kept for existing callers/tests) and the
+    private :data:`_RELAY_SAFE_RAN` sentinel :meth:`Relay.step` actually checks.
+    """
+    exc.record = record
+    setattr(exc, _RELAY_SAFE_RAN, True)
+
 
 def _scalar(section: dict[str, Any], key: str) -> Any:
     """One config value, with this repo's empty-key parse handled.
@@ -499,10 +516,15 @@ class Relay:
         try:
             return self._step_inner()
         except Exception as exc:                                      # noqa: BLE001
-            if getattr(exc, "record", None) is None:
-                exc.record = self.safe(
+            # S4: run the fail-safe unless THIS exception already carries our
+            # private marker. Checking `.record is not None` let an injected
+            # dependency's unrelated exception (one that happens to have a
+            # `.record` attribute) skip safe() -- a foreign attribute is not
+            # evidence that the abort path ran.
+            if getattr(exc, _RELAY_SAFE_RAN, False) is not True:
+                _mark_safe_ran(exc, self.safe(
                     reason="step() raised before/around the write guard: %s: %s"
-                           % (type(exc).__name__, exc))
+                           % (type(exc).__name__, exc)))
             raise
 
     def _step_inner(self) -> RelayRecord:
@@ -578,13 +600,13 @@ class Relay:
         except _circ.SafetyError as exc:
             record = self.safe(
                 reason="DF9=%r was refused by the circulator (%s)" % (value, exc))
-            exc.record = record
+            _mark_safe_ran(exc, record)  # S4
             raise
         except Exception as exc:                                      # noqa: BLE001
             record = self.safe(
                 reason="the circulator write path raised %s: %s"
                        % (type(exc).__name__, exc))
-            exc.record = record
+            _mark_safe_ran(exc, record)  # S4
             raise
 
         outcome = write_dict.get("outcome")
@@ -774,6 +796,7 @@ class Relay:
         error.record = safe_record
         error.write = safe_record.write
         error.pid = safe_record.quality.get("pid_disable")
+        setattr(error, _RELAY_SAFE_RAN, True)  # S4
         raise error
 
     def _on_write_failure(self, now: float, write: dict) -> None:
@@ -802,6 +825,7 @@ class Relay:
         error.record = safe_record
         error.write = safe_record.write
         error.pid = safe_record.quality.get("pid_disable")
+        setattr(error, _RELAY_SAFE_RAN, True)  # S4
         raise error
 
     def _fail_safe_outcome(self, record: RelayRecord) -> tuple[type, str]:
@@ -829,6 +853,23 @@ class Relay:
             "setpoint and the loop may not be open. %s"
             % (float(self.policy.safe_setpoint_c), write_outcome, pid_outcome,
                self.HONEST_RESIDUAL))
+
+    @staticmethod
+    def _defensive_now() -> tuple[str, float]:
+        """Timestamps for a safe-mode record, each isolated so a failing clock
+        can NEVER skip the physical safe actions (S6). A timestamp is metadata;
+        the bath write and PID disable are the abort itself, so they must run
+        even if the clock raises. Returns "" / 0.0 for whichever call fails.
+        """
+        try:
+            t_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        except Exception:                                             # noqa: BLE001
+            t_utc = ""
+        try:
+            monotonic_s = time.monotonic()
+        except Exception:                                             # noqa: BLE001
+            monotonic_s = 0.0
+        return t_utc, monotonic_s
 
     # -- the pre-declared fail-safe ---------------------------------------
     def safe(self, *, reason: str = "explicit safe() call") -> RelayRecord:
@@ -865,9 +906,10 @@ class Relay:
         # a fail-safe whose recording blew up is still a fail-safe that ran.
         self._safe_mode = True
         record: RelayRecord | None = None
+        # S6: compute timestamps defensively BEFORE the guarded region, so a
+        # failing clock cannot skip the safe bath write + PID disable below.
+        t_utc, monotonic_s = self._defensive_now()
         try:
-            t_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            monotonic_s = time.monotonic()
             try:
                 write_dict: dict[str, Any] | None = None
                 write_error: str | None = None
@@ -1004,6 +1046,11 @@ class Relay:
                 "refusing to rearm the relay: circulator.allow_actuation is off. "
                 "Re-arming resumes forwarding the PID output to the bath, which "
                 "is an actuation and must be enabled deliberately.")
+        # S7: obtain everything that can raise BEFORE mutating state. If the
+        # clock raises, rearm() must leave the latch INTACT (fail closed) rather
+        # than raise AFTER forwarding was already re-enabled. The latch and
+        # timers are cleared only once the rearm will certainly complete.
+        t_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
         was = self.safe_mode
         self._safe_mode = False
         self._bad_since = None
@@ -1013,7 +1060,7 @@ class Relay:
             "action": "rearm",
             "was_safe_mode": was,
             "rearm_count": self._rearm_count,
-            "t_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "t_utc": t_utc,
             "note": "safe mode cleared by explicit rearm(); the PID was NOT "
                     "re-enabled -- that is a separate, deliberate operator action.",
         }

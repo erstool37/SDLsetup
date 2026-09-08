@@ -205,6 +205,18 @@ person at the rig or a PLC-side ladder change. Nothing in software closes this
 gap — it is available as `Relay.HONEST_RESIDUAL`, to be passed to `run.note()`,
 because silence there would read as "handled".
 
+**The general form of this limit: a software fail-safe can only reach the
+declared safe state while the abort commands themselves still have working
+communication.** The abort is two device writes — the safe setpoint to the
+circulator over serial, and the PID disable (`C1 = False`) to the PLC over
+Modbus TCP. If either link is dead, the relay latches safe mode and reports
+`FailSafeIncomplete` (carrying only what it *attempted*), but it cannot make the
+hardware receive the command, so it cannot establish the physical safe state.
+Closing that requires an **independent device-side watchdog** — a PLC-ladder
+heartbeat timeout (`SD41`) or MCU firmware — which this host layer cannot
+provide. This is a known limitation of any host-mediated fail-safe, not a bug in
+this one.
+
 ### What this layer cannot protect against
 
 **Every watchdog in the relay is cooperative, and cannot act if the host loop
