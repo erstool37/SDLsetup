@@ -302,6 +302,23 @@ fourth (vendor-confirmed, CLICK and CLICK PLUS manuals). So:
 unit id, so this is the pymodbus library default rather than a value read off the
 PLC. `TODO(operator): confirm the CLICK's Modbus device id in its project file.`
 
+## Injection seams are trusted
+
+`PlcClient`, `Circulator`, and `SerialLink` accept an injected transport, clock,
+and settings so the tests can drive them with in-memory fakes. A caller who
+injects a hostile duck-typed settings object (`allow_actuation="false"`), a clock
+returning `NaN`, or a fake transport that returns non-`int` register words is
+past the accidental-misuse line -- the same category as `object.__setattr__` and
+private-name access, which Python cannot prevent.
+
+The real operational path does none of this: settings are built by `from_config`
+(validated), the transport is the real pymodbus client (which returns clean
+16-bit ints), and the clock is `time.monotonic`. The read path still fails a
+malformed payload closed -- a non-`int` or out-of-range word makes
+`read_ok=False` -- because that guards the wire, not the seam. These seams are
+trusted by design; the ability to feed them hostile objects is **not** an open
+guard, and code is deliberately not added to defend them.
+
 ## Files
 
 | File | Holds |

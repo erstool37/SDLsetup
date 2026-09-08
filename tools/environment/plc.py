@@ -288,6 +288,17 @@ class PlcSettings:
                 raise _config.ConfigError(
                     "environment.%s must be a non-negative integer, got %r"
                     % (name, value))
+        # P7: the two protocol-address fields carry real range limits, not just
+        # non-negativity. A real int outside these ranges cannot address the
+        # CLICK and is refused rather than handed to the transport.
+        if not 1 <= self.port <= 65535:
+            raise _config.ConfigError(
+                "environment.port must be a TCP port in 1..65535, got %r"
+                % (self.port,))
+        if not 1 <= self.device_id <= 247:
+            raise _config.ConfigError(
+                "environment.device_id must be a Modbus unit id in 1..247, got %r"
+                % (self.device_id,))
         # S2: durations required FINITE and positive, not merely > 0. NaN/inf pass
         # a bare `<= 0` check and then mis-time a socket or a watchdog. Routed
         # through the shared validator so every numeric field added later
@@ -654,19 +665,24 @@ class PlcClient:
             self.last_error = "read_holding_registers(%d, count=%d): response " \
                 "carried no registers: %r" % (address, count, result)
             return None
-        # G7: the int() conversion is INSIDE the read guard. A malformed payload
-        # (a non-integer register word) is a failed read (read_ok False), not an
-        # exception that escapes read_block past every caller's guard.
-        # S5: int(float("inf")) raises OverflowError and int(float("nan")) raises
-        # ValueError; both must fail the read CLOSED (read_ok False), never escape
-        # read_block past every caller's guard as an uncaught exception.
-        try:
-            return [int(word) for word in words]
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.last_error = ("read_holding_registers(%d, count=%d): non-integer "
-                               "register in payload %r: %s"
-                               % (address, count, words, exc))
-            return None
+        # G7/S5/P1: the payload check is INSIDE the read guard. A real Modbus
+        # transport returns clean 16-bit unsigned register words; a malformed
+        # payload -- a string, a float, a bool, a negative, or a value above
+        # 0xFFFF -- is a FAILED read (read_ok False), never coerced with int()
+        # and never an exception that escapes read_block past every caller's
+        # guard. bool is rejected explicitly: it is an int subclass, so True
+        # would otherwise read through as the register value 1.
+        validated: list[int] = []
+        for word in words:
+            if (not isinstance(word, int) or isinstance(word, bool)
+                    or not 0 <= word <= 0xFFFF):
+                self.last_error = (
+                    "read_holding_registers(%d, count=%d): register word %r is "
+                    "not an int in 0..0xFFFF; failing the read CLOSED rather "
+                    "than coercing it" % (address, count, word))
+                return None
+            validated.append(word)
+        return validated
 
     def read_pid_enabled(self) -> bool | None:
         """Coil C1, the PID auto/manual flag. ``None`` when it could not be read.

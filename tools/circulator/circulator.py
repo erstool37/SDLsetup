@@ -181,6 +181,18 @@ class CirculatorSettings:
                 f"would switch actuation ON")
         # Raises if the pair is inverted, non-finite, or WIDER than the code
         # ceiling. Config may tighten this range, never loosen it.
+        # P5: validate the command-gate bounds are REAL finite numbers BEFORE
+        # float() sees them. float("5") and float(True) both succeed, so a
+        # string or bool would slip past CommandLimits' own bool/number check by
+        # being coerced first -- the exact coerce-instead-of-validate defect.
+        for _bound_name in ("command_min_c", "command_max_c"):
+            _bound_raw = getattr(self, _bound_name)
+            if (isinstance(_bound_raw, bool)
+                    or not isinstance(_bound_raw, (int, float))
+                    or not math.isfinite(float(_bound_raw))):
+                raise CirculatorError(
+                    f"{_bound_name} must be a real finite number, got "
+                    f"{_bound_raw!r}")
         CommandLimits(min_c=float(self.command_min_c), max_c=float(self.command_max_c))
 
     # -- construction -----------------------------------------------------

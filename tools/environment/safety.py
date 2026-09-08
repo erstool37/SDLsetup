@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from typing import Any
 
 from . import registers
 
@@ -129,6 +130,43 @@ class ActuationNotAllowed(SafetyError):
     """A write was attempted without ``allow_actuation``."""
 
 
+def _require_bool(name: str, value: Any, *, error: type = SafetyError) -> bool:
+    """Validate, never coerce: a flag must be a REAL bool.
+
+    ``bool`` is an ``int`` subclass, so ``bool("false")`` is ``True`` and
+    ``bool(0.0)`` is ``False`` -- both plausible gate states a typo produces.
+    A LOCAL copy of the ``plc.py`` helper: ``plc.py`` imports from this module,
+    so this module cannot import back from it, and each package keeps its own
+    small validators rather than growing a cross-package dependency.
+    """
+    if not isinstance(value, bool):
+        raise error(
+            "%s must be a real bool (True/False), got %s %r; refusing to coerce"
+            % (name, type(value).__name__, value))
+    return value
+
+
+def _require_finite(name: str, value: Any, *, positive: bool = False,
+                    non_negative: bool = False, error: type = SafetyError) -> float:
+    """Validate a finite real number; reject bool, non-numbers, NaN and inf.
+
+    ``NaN <= 0`` and ``inf <= 0`` are both ``False``, so a bound-only check lets
+    a malformed number through to mis-time or mis-bound. Local copy of the
+    ``plc.py`` helper, for the same no-cross-package-dependency reason as
+    :func:`_require_bool`.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value):
+        raise error("%s must be a finite number, got %s %r"
+                    % (name, type(value).__name__, value))
+    number = float(value)
+    if positive and number <= 0.0:
+        raise error("%s must be positive, got %r" % (name, value))
+    if non_negative and number < 0.0:
+        raise error("%s must not be negative, got %r" % (name, value))
+    return number
+
+
 _VALIDATION_TOKEN = object()
 
 
@@ -205,10 +243,9 @@ class SetpointLimits:
             ("temp_max_c", TEMP_MAX_C, "above"),
             ("rh_max_pct", RH_MAX_PCT, "above"),
         ):
-            value = getattr(self, name)
-            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                raise SafetyError("%s must be a finite number, got %r" % (name, value))
-            value = float(value)
+            # P3: reject bool as well as non-numbers/NaN/inf -- bool is an int
+            # subclass, so True would otherwise pass as the bound 1.0.
+            value = _require_finite(name, getattr(self, name))
             if direction == "below" and value < ceiling:
                 raise SafetyError(
                     "%s=%g is BELOW the code floor %g. config may tighten a "
@@ -315,12 +352,10 @@ class RateLimiter:
     min_interval_s: float = MIN_INTERVAL_S
 
     def __post_init__(self) -> None:
+        # P4: reject bool as well as non-numbers/NaN/inf; a cap of True would
+        # otherwise be the value 1.0.
         for name in ("max_step_c", "max_step_pct", "min_interval_s"):
-            value = getattr(self, name)
-            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                raise SafetyError("%s must be a finite number, got %r" % (name, value))
-            if float(value) < 0.0:
-                raise SafetyError("%s must not be negative, got %r" % (name, value))
+            _require_finite(name, getattr(self, name), non_negative=True)
 
     def max_step_for(self, field: str) -> float:
         kind = _BOUND_KIND.get(field)
@@ -346,15 +381,18 @@ class RateLimiter:
         the step cap only; the interval rule still applies, because two writes
         in quick succession are a bug in the caller either way.
         """
-        if not math.isfinite(float(now)):
-            raise SafetyError("%s: `now` is not finite (%r)" % (field, now))
-        if not math.isfinite(float(value)):
-            raise SafetyError("%s: setpoint is not finite (%r)" % (field, value))
+        # P4: validate, never coerce. `allow_large_step` is the step-cap
+        # override, so it must be a REAL bool -- "false" is truthy and would
+        # bypass the cap below. `now`/`value`/`last_time` are finite reals with
+        # bool rejected; float() on a wrong-typed reading would make a bad value
+        # look plausible instead of failing it.
+        _require_bool("allow_large_step", allow_large_step)
+        now = _require_finite("%s: now" % field, now)
+        value = _require_finite("%s: setpoint" % field, value)
 
         if last_time is not None:
-            if not math.isfinite(float(last_time)):
-                raise SafetyError("%s: `last_time` is not finite (%r)" % (field, last_time))
-            elapsed = float(now) - float(last_time)
+            last_time = _require_finite("%s: last_time" % field, last_time)
+            elapsed = now - last_time
             if elapsed < 0.0:
                 # Refused rather than treated as a long wait: a clock that ran
                 # backwards means the interval is unknown, and an unknown
@@ -370,8 +408,9 @@ class RateLimiter:
 
         if last_value is None or allow_large_step:
             return
+        last_value = _require_finite("%s: last_value" % field, last_value)
         cap = self.max_step_for(field)
-        step = abs(float(value) - float(last_value))
+        step = abs(value - last_value)
         if step > cap:
             raise RateLimited(
                 "%s: a step of %g from %g to %g exceeds the cap %g. Refused, "

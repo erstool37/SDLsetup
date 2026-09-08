@@ -318,6 +318,15 @@ ls -l /dev/ttyUSB*                 # find the node -- does NOT open it
   by introspecting the client's signature, so it works either side of that
   rename, but the pin is what keeps the rest of the tree consistent.
 
+## Injection seams are trusted
+
+`Circulator` and `SerialLink` accept an injected settings object and transport
+for testing; a caller who hands them a hostile duck-typed settings
+(`allow_actuation="false"`) or a fake transport is past the accidental-misuse
+line, so the real path builds settings via `from_config` (validated) and opens
+the real serial port, and these seams are trusted by design rather than defended
+in code.
+
 ## Tests
 
 ```bash

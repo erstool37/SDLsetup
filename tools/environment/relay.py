@@ -566,7 +566,11 @@ class Relay:
         # shows that can be a saturated 30 C), so drive it to the declared safe
         # setpoint ONCE and keep reporting. This does not latch safe mode and
         # does not disable the PID: turning C1 back on resumes forwarding.
-        if reading.pid_enabled is False:
+        # P2: only pid_enabled EXACTLY True forwards the live output. None was
+        # handled above as UNKNOWN (H1). Everything else -- False (deliberate
+        # off, H2) and any non-bool -- is "not enabled": the live output is not
+        # forwarded and the bath is driven to the declared safe setpoint once.
+        if reading.pid_enabled is not True:
             return self._pid_off_safe(now, reading)
 
         # pid_enabled is True: the loop is closed. A later PID-off episode may
@@ -733,9 +737,11 @@ class Relay:
         forwarded channel passes it -- see the module docstring. Do not reduce
         this to ``reading.read_ok``.
         """
-        if not reading.read_ok:
-            return ("the PLC read failed: no register pair arrived, so there is "
-                    "no value to forward and nothing to substitute for one")
+        if reading.read_ok is not True:
+            return ("the PLC read did not report a clean success (read_ok is not "
+                    "exactly True): there is no value to forward and nothing to "
+                    "substitute for one. P2: truthiness is not enough -- a "
+                    "non-bool read_ok is a malformed reading, not a good read")
         if reading.partial:
             return ("the block is PARTIAL (%d of %d words arrived). read_ok is "
                     "True for a short block -- some pairs decoded -- so read_ok "
@@ -1039,8 +1045,15 @@ class Relay:
                 "staleness timer was cleared."
                 % (None if last_safe is None
                    else last_safe.quality.get("safe_confirmed")))
-        allowed = bool(getattr(getattr(self.circulator, "settings", None),
-                               "allow_actuation", False))
+        # P6: the settings class validates allow_actuation is a REAL bool, so on
+        # the real path this getattr returns one. Require a real bool here too so
+        # a duck-typed settings override ("false", 1) is refused rather than read
+        # through bool() as an authorization it never granted.
+        allowed = _safety._require_bool(
+            "circulator.settings.allow_actuation",
+            getattr(getattr(self.circulator, "settings", None),
+                    "allow_actuation", False),
+            error=ActuationNotAllowed)
         if not allowed:
             raise ActuationNotAllowed(
                 "refusing to rearm the relay: circulator.allow_actuation is off. "
