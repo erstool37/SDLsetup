@@ -13,6 +13,12 @@ reimplement a bound that already exists.
 :class:`FakeSerial` is re-exported because tests are legitimate callers and it
 is the ONLY transport they may use -- see :mod:`tools.circulator.link` for why
 no test opens a real port.
+
+:class:`~tools.circulator.link.SerialLink` is **deliberately NOT re-exported**
+(F2c). It is a raw write-capable transport, and its low-level write now accepts
+only a private fixed-frame object built by the setpoint codec -- but it is not
+part of the public surface. Orchestration reaches the wire through
+:meth:`Circulator.write_setpoint`, which bounds the setpoint first.
 """
 from __future__ import annotations
 
@@ -36,7 +42,7 @@ from .codec import (
     describe_frame,
     encode_setpoint,
 )
-from .link import FakeSerial, SerialLink, WriteResult
+from .link import FakeSerial, WriteResult
 from .node import CirculatorNode
 from .safety import (
     COMMAND_MAX_C,
@@ -71,7 +77,6 @@ __all__ = [
     "CommandLimits",
     "FakeSerial",
     "SafetyError",
-    "SerialLink",
     "WriteResult",
     "decode_setpoint",
     "describe_frame",

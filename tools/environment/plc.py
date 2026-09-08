@@ -659,6 +659,22 @@ class PlcClient:
                 "number would put an unbounded setpoint on the wire, which is "
                 "the defect this type exists to prevent." % type(sp).__name__)
 
+        # F2b: the token proves *a* bound ran, not that it ran against THIS
+        # client's limits or targets a canonical register. Re-validate at the
+        # sink: the value against the receiving client's current SetpointLimits
+        # (raises if outside), and the token's spec against the canonical
+        # WRITABLE spec for its field (a token whose spec is not the canonical
+        # one is refused). A token validated under a wider range or redirected to
+        # a non-canonical register is not trusted blindly across the boundary.
+        self.settings.limits.validate(sp.field, sp.value)
+        canonical = registers.WRITABLE.get(sp.field)
+        if canonical is None or sp.spec is not canonical:
+            raise SafetyError(
+                "write_float32(): the setpoint token for %r does not carry the "
+                "canonical WRITABLE register spec for that field (got spec %r). A "
+                "token whose spec was redirected is refused at the sink." %
+                (sp.field, sp.spec))
+
         low_word, high_word = registers.f32_to_regs(sp.value)
         words = (low_word, high_word)
         address = sp.spec.address

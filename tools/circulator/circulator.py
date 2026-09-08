@@ -335,6 +335,12 @@ class Circulator:
                 f"is the ONLY temperature limit that exists for this device, which "
                 f"is a custom board with no documented clamp of its own."
             )
+        # F2b: the token proves *a* bound ran, not that it ran against THIS
+        # client's limits. A token validated under a wider or different range
+        # (e.g. (0, 30) while this run's bound is (10, 30)) must not be trusted
+        # blindly across the boundary -- re-validate its value against the
+        # receiving client's own bound, which raises if it is outside.
+        self.limits.validate(sp.value_c)
         values = encode_setpoint(sp.value_c)
         if not self.settings.allow_actuation:
             # outcome="planned", so `ok` is False: nothing was written, and
@@ -343,7 +349,10 @@ class Circulator:
                 outcome=WriteResult.PLANNED, address=SETPOINT_ADDRESS,
                 values=values,
             )
-        return self._link.write_registers(SETPOINT_ADDRESS, values)
+        # F2c: the raw wire takes ONLY a private fixed-frame object, built solely
+        # by the setpoint codec at the canonical address/count -- never an
+        # arbitrary (address, values) pair.
+        return self._link.write_registers(self._link.encode_frame(sp.value_c))
 
     def plan_setpoint(self, sp: BoundedSetpoint) -> dict:
         """What a write would send, without sending it. Never opens the port."""

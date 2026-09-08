@@ -118,7 +118,7 @@ ok(fake.close_count == 1 and not link.is_open, "close() closes once")
 print("\n--- a session records what it did ---")
 fake = FakeSerial()
 with SerialLink(live(), transport=fake) as link:
-    result = link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0x3940])
+    result = link.write_registers(SerialLink.encode_frame(25.0))
 ok(isinstance(result, WriteResult) and result.outcome == CONFIRMED,
    "a matching echo is outcome=%r" % CONFIRMED, result.outcome)
 ok(result.ok is True, "and ok is True -- the ONLY state for which it is")
@@ -138,7 +138,7 @@ link = SerialLink(live(boot_settle_s=30.0), transport=fake)
 link.open(settle=False)
 ok(link.settle_remaining_s > 0, "the settle window is still open",
    "%.1f s left" % link.settle_remaining_s)
-blocked(lambda: link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0]),
+blocked(lambda: link.write_registers(SerialLink.encode_frame(0.0)),
         "a frame during the boot window raises", SafetyError)
 ok(fake.frames == [], "and no frame was sent")
 link.close()
@@ -146,14 +146,14 @@ link.close()
 print("\n--- writing without opening is refused rather than opening implicitly ---")
 fake = FakeSerial()
 link = SerialLink(live(), transport=fake)
-blocked(lambda: link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0]),
+blocked(lambda: link.write_registers(SerialLink.encode_frame(0.0)),
         "write_registers on a closed link raises")
 ok(fake.open_count == 0, "and does NOT reset the MCU to satisfy the caller")
 
 print("\n--- THE DEFECT: the prior code never checked what came back ---")
 fake = FakeSerial(echo_address=999)
 with SerialLink(live(), transport=fake) as link:
-    bad = link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0x3940])
+    bad = link.write_registers(SerialLink.encode_frame(25.0))
 ok(bad.outcome == FAILED and bad.ok is False,
    "an echoed address of 999 is outcome=%r, ok=False" % FAILED, bad.outcome)
 ok(bad.error and "999" in bad.error, "and says what came back", str(bad.error)[:60])
@@ -161,19 +161,19 @@ ok(bad.echo_address == 999, "the observed echo is preserved, not overwritten")
 
 fake = FakeSerial(echo_count=2)
 with SerialLink(live(), transport=fake) as link:
-    bad = link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0x3940])
+    bad = link.write_registers(SerialLink.encode_frame(25.0))
 ok(bad.outcome == FAILED and bad.ok is False,
    "an echoed count of 2 for a 4-register write is outcome=%r" % FAILED)
 
 fake = FakeSerial(error_response=True)
 with SerialLink(live(), transport=fake) as link:
-    bad = link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0x3940])
+    bad = link.write_registers(SerialLink.encode_frame(25.0))
 ok(bad.outcome == FAILED and bad.ok is False and bad.error,
    "a Modbus exception response is outcome=%r" % FAILED)
 
 fake = FakeSerial(fail_write=True)
 with SerialLink(live(), transport=fake) as link:
-    bad = link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0x3940])
+    bad = link.write_registers(SerialLink.encode_frame(25.0))
 ok(bad.outcome == FAILED and bad.ok is False and bad.error,
    "a raised transport error is outcome=%r, not an exception" % FAILED)
 ok(bad.dry_run is False and bad.sent is True, "and is not mistaken for a dry run")
@@ -233,6 +233,66 @@ print("\n--- a failing open is a failure, not a silent half-open link ---")
 link = SerialLink(live(), transport=FakeSerial(fail_open=True))
 blocked(link.open, "a transport that cannot connect raises")
 ok(not link.is_open, "and the link does not claim to be open")
+
+print("\n--- F2c: the raw wire takes ONLY a codec-built frame, not (address, values) ---")
+# The prior write_registers(address, values) accepted any list at any address:
+# a 1-register partial write, a PLC-codec pair, NaN bits. Now it takes only a
+# private _SetpointFrame built by encode_frame at the canonical address 980.
+frame = SerialLink.encode_frame(25.0)
+ok(frame.address == SETPOINT_ADDRESS and frame.values == [0, 0, 0, 0x3940],
+   "encode_frame builds the canonical 4-register frame at address 980",
+   "%d %r" % (frame.address, frame.values))
+with SerialLink(live(), transport=FakeSerial()) as link:
+    blocked(lambda: link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0x3940]),
+            "a raw (address, values) call no longer even fits the signature",
+            TypeError)
+    blocked(lambda: link.write_registers([0, 0, 0, 0x3940]),
+            "a bare register list is refused -- not a codec-built frame", SafetyError)
+    blocked(lambda: link.write_registers([0x3940]),
+            "a 1-register partial write cannot even be expressed", SafetyError)
+    good = link.write_registers(SerialLink.encode_frame(25.0))
+    ok(good.outcome == CONFIRMED, "the codec-built frame is accepted and confirmed")
+# NaN cannot be encoded into a frame at all: the codec refuses it upstream.
+blocked(lambda: SerialLink.encode_frame(float("nan")),
+        "encode_frame refuses NaN, so NaN bits cannot reach the wire", ValueError)
+# And the public API surface no longer re-exports the raw transport.
+import tools.circulator.api as _circ_api  # noqa: E402
+
+ok("SerialLink" not in _circ_api.__all__ and not hasattr(_circ_api, "SerialLink"),
+   "SerialLink is NOT re-exported from tools.circulator.api")
+
+print("\n--- F11: a matching echo with a non-FC16 function code is NOT confirmed ---")
+# This firmware returns MALFORMED exception frames -- function code 0x81 where an
+# FC3 exception must be 0x83. A frame whose address and count line up but whose
+# function code is not 0x10 must be judged FAILED, never confirmed.
+fake = FakeSerial(function_code=0x81)   # matching address/count, isError False
+with SerialLink(live(), transport=fake) as link:
+    bad = link.write_registers(SerialLink.encode_frame(25.0))
+ok(bad.outcome == FAILED and bad.ok is False,
+   "a malformed 0x81 frame with matching address/count is FAILED", bad.outcome)
+ok(bad.error and "0x81" in bad.error and "0x10" in bad.error,
+   "and the error names the bad function code and the expected FC16", str(bad.error)[:90])
+fake = FakeSerial(function_code=0x10)
+with SerialLink(live(), transport=fake) as link:
+    good = link.write_registers(SerialLink.encode_frame(25.0))
+ok(good.outcome == CONFIRMED, "the real FC16 (0x10) response still confirms", good.outcome)
+
+print("\n--- F10: a failed open still COUNTS the MCU reset it caused ---")
+# connect() asserts DTR (resetting the MCU) before it can report failure, so a
+# failed open must record reset_attempted, distinct from a connection being
+# established -- otherwise diagnostics claim no reset happened and a retry
+# resets the board again unaccounted.
+link = SerialLink(live(), transport=FakeSerial(fail_open=True))
+blocked(link.open, "a connect that raises is a failure")
+ok(link.reset_attempts == 1, "but the reset it caused is COUNTED", "reset_attempts=%d" % link.reset_attempts)
+ok(link.open_count == 0, "while open_count stays 0 -- no connection was established")
+ok(not link.is_open, "and the link is not left half-open")
+pp = link.port_present()
+ok(pp.get("reset_attempts") == 1 and pp.get("open_count") == 0,
+   "port_present surfaces both counters", str({k: pp.get(k) for k in ("reset_attempts", "open_count")}))
+# A retry resets it again, and that is visible as a second attempt.
+blocked(link.open, "a retry after a failed open is refused too")
+ok(link.reset_attempts == 2, "and is counted as a SECOND reset attempt", "reset_attempts=%d" % link.reset_attempts)
 
 print("\n%s" % ("ALL PASS" if fails == 0 else "%d FAILURE(S)" % fails))
 sys.exit(1 if fails else 0)

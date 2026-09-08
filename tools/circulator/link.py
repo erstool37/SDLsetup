@@ -54,7 +54,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .codec import REGISTER_MAX
+from .codec import REGISTER_MAX, SETPOINT_ADDRESS, encode_setpoint
 from .safety import ActuationNotAllowed, CirculatorError, SafetyError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
@@ -65,6 +65,46 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
 #: that, ``unit``. Picked by introspection rather than by try/except so a real
 #: TypeError from the call is not swallowed as a version difference.
 _UNIT_KWARGS = ("device_id", "slave", "unit")
+
+#: Modbus function code for write-multiple-registers (FC16). A confirmed write
+#: MUST carry this code. This firmware is known to return MALFORMED exception
+#: frames -- function code 0x81 where an FC3 exception must be 0x83 -- so a
+#: response whose address and count happen to match but whose function code is
+#: not 0x10 is NOT a confirmation (F11).
+_FC16 = 0x10
+
+#: Private token: only :meth:`SerialLink.encode_frame` may build a
+#: :class:`_SetpointFrame`.
+_FRAME_TOKEN = object()
+
+
+class _SetpointFrame:
+    """The ONLY argument :meth:`SerialLink.write_registers` accepts (F2c).
+
+    Built solely by :meth:`SerialLink.encode_frame`, which runs the canonical
+    setpoint codec at the one established transaction -- 4 registers at address
+    980. Possession is proof the bytes ARE a setpoint frame: an arbitrary
+    ``(address, values)`` pair, a 1-register partial write, a PLC-codec word
+    pair, or NaN bits cannot be expressed through this type, because the only
+    constructor runs :func:`~tools.circulator.codec.encode_setpoint` at the
+    fixed address.
+
+    It is an **accidental-misuse aid, not a security boundary**: ``_FRAME_TOKEN``
+    is reachable by anyone determined to forge one, exactly as any Python private
+    is. The point is that no *supported* path builds an arbitrary frame, so a
+    bypass is visible as one.
+    """
+
+    __slots__ = ("address", "values")
+
+    def __init__(self, token: object, address: int, values: list[int]) -> None:
+        if token is not _FRAME_TOKEN:
+            raise SafetyError(
+                "_SetpointFrame() may only be built by SerialLink.encode_frame(); "
+                "constructing one directly would restore the arbitrary "
+                "(address, values) wire path this type exists to remove.")
+        object.__setattr__(self, "address", int(address))
+        object.__setattr__(self, "values", list(values))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,6 +203,10 @@ class SerialLink:
         self._sleep = sleep or time.sleep
         self._open = False
         self._open_count = 0
+        #: Times ``connect()`` was CALLED -- i.e. times the OS asserted DTR and
+        #: thus reset the MCU, whether or not the open then succeeded (F10). This
+        #: is >= ``_open_count``: a connect that raises still reset the board.
+        self._reset_attempts = 0
         self._settle_deadline: float = 0.0
         self._last_event: dict | None = None
 
@@ -185,6 +229,14 @@ class SerialLink:
         return self._open_count
 
     @property
+    def reset_attempts(self) -> int:
+        """Times an open was *attempted* -- every ``connect()`` call asserted DTR
+        and reset the MCU, even the ones that then raised or returned False (F10).
+        ``reset_attempts >= open_count``; a gap means an open reset the board and
+        then failed."""
+        return self._reset_attempts
+
+    @property
     def last_event(self) -> dict | None:
         return self._last_event
 
@@ -203,23 +255,28 @@ class SerialLink:
         listening on it, and it cannot identify the device. That is the honest
         limit of what is knowable without actuating.
         """
+        counters = {"open_count": self._open_count,
+                    "reset_attempts": self._reset_attempts,
+                    "last_event": self._last_event}
         port = self.settings.port
         if port is None:
             return {"port": None, "present": False, "method": "stat",
                     "note": "no port configured; nothing was opened",
                     "detail": "TODO(operator): record the device path after "
-                              "usbipd attach makes the bridge visible to WSL"}
+                              "usbipd attach makes the bridge visible to WSL",
+                    **counters}
         path = Path(str(port))
         try:
             present = path.exists()
             mode = os.stat(path).st_mode if present else None
         except OSError as exc:
             return {"port": str(port), "present": False, "method": "stat",
-                    "error": str(exc), "note": "nothing was opened"}
+                    "error": str(exc), "note": "nothing was opened", **counters}
         return {"port": str(port), "present": bool(present), "method": "stat",
                 "st_mode": mode,
                 "note": "path presence only -- the port was NOT opened, because "
-                        "opening it asserts DTR and resets the MCU"}
+                        "opening it asserts DTR and resets the MCU",
+                **counters}
 
     # -- actuation --------------------------------------------------------
     def _build_transport(self) -> Any:
@@ -271,17 +328,40 @@ class SerialLink:
             )
         if self._transport is None:
             self._transport = self._build_transport()
+        # F10: the OS asserts DTR the instant connect() touches the port, which
+        # resets the MCU -- BEFORE we learn whether connect() succeeds. Record
+        # that a reset was ATTEMPTED first, distinct from a connection being
+        # established, so a connect that then raises or returns False cannot make
+        # diagnostics claim no reset happened. A later retry would reset it again.
+        self._reset_attempts += 1
+        self._last_event = {
+            "action": "open_attempt",
+            "port": str(settings.port),
+            "reset_attempted": True,
+            "mcu_reset": True,
+            "connection_established": False,
+            "reason": "DTR asserted on open; DTR is coupled to /RESET on the FT232R",
+            "reset_attempts": self._reset_attempts,
+            "open_count": self._open_count,
+        }
         self._emit("OPENING %s -- ASSERTS DTR, RESETS THE MCU" % settings.port, "warn")
         try:
             connected = self._transport.connect()
         except Exception as exc:
+            # The reset already happened; close any partially-opened transport so
+            # a half-open handle is not left behind, and surface the reset above.
+            self._safe_close_transport()
             raise CirculatorError(
-                f"could not open the circulator port {settings.port}: {exc}"
+                f"could not open the circulator port {settings.port}: {exc} "
+                f"(the open asserted DTR and reset the MCU regardless; "
+                f"reset_attempts={self._reset_attempts})"
             ) from exc
         if connected is False:
+            self._safe_close_transport()
             raise CirculatorError(
                 f"could not open the circulator port {settings.port}: the transport "
-                f"reported failure. Nothing further was attempted."
+                f"reported failure. The open still reset the MCU "
+                f"(reset_attempts={self._reset_attempts}); nothing further was attempted."
             )
         self._open = True
         self._open_count += 1
@@ -290,7 +370,10 @@ class SerialLink:
             "action": "open",
             "port": str(settings.port),
             "mcu_reset": True,
+            "reset_attempted": True,
+            "connection_established": True,
             "reason": "DTR asserted on open; DTR is coupled to /RESET on the FT232R",
+            "reset_attempts": self._reset_attempts,
             "open_count": self._open_count,
             "boot_settle_s": float(settings.boot_settle_s),
         }
@@ -307,17 +390,44 @@ class SerialLink:
             self._sleep(remaining)
         return remaining
 
-    def write_registers(self, address: int, values: Sequence[int]) -> WriteResult:
-        """Write holding registers and CHECK WHAT CAME BACK.
+    @staticmethod
+    def encode_frame(value_c: float) -> _SetpointFrame:
+        """Build the one wire frame this transport will send (F2c).
+
+        The sole constructor of the private :class:`_SetpointFrame`
+        :meth:`write_registers` accepts: it runs the canonical setpoint codec at
+        address 980, count 4. There is no supported way to build a frame at any
+        other address, with any other count, or carrying NaN bits
+        (:func:`~tools.circulator.codec.encode_setpoint` refuses those).
+        """
+        return _SetpointFrame(_FRAME_TOKEN, SETPOINT_ADDRESS,
+                              encode_setpoint(value_c))
+
+    def write_registers(self, frame: _SetpointFrame) -> WriteResult:
+        """Write the setpoint frame and CHECK WHAT CAME BACK.
+
+        Accepts **only** a :class:`_SetpointFrame` built by :meth:`encode_frame`;
+        a raw ``(address, values)`` pair, a 1-register partial write, or a
+        PLC-codec word pair can no longer reach the wire (F2c). The frame object
+        is an accidental-misuse aid, not a security boundary.
 
         Returns a :class:`WriteResult`; a rejected or mismatched write is
         ``ok=False``, not an exception, because the response is a measurement
         and what to do about it is the caller's decision.
 
-        Raises only when the write must not be attempted at all: the link is not
-        open, or the MCU is still inside its post-reset boot window.
+        Raises only when the write must not be attempted at all: a non-frame
+        argument, the link not open, or the MCU still inside its post-reset boot
+        window.
         """
-        frame = self._check_frame(address, values)
+        if not isinstance(frame, _SetpointFrame):
+            raise SafetyError(
+                "write_registers accepts only a _SetpointFrame built by "
+                "SerialLink.encode_frame(); a raw (address, values) pair, a "
+                "partial write, or a PLC-codec word pair cannot reach the wire. "
+                "The frame object is an accidental-misuse aid, not a security "
+                "boundary. Got %r." % (type(frame).__name__,))
+        address = frame.address
+        values = self._check_frame(address, frame.values)
         if not self._open:
             raise CirculatorError(
                 "the circulator link is not open. Refusing to open it implicitly: "
@@ -332,14 +442,14 @@ class SerialLink:
                 f"neither delivered nor reported as lost."
             )
         try:
-            response = self._send(address, frame)
+            response = self._send(address, values)
         except Exception as exc:
             self._emit("write %d failed: %s" % (address, exc), "error")
             return WriteResult(outcome=WriteResult.FAILED, address=int(address),
-                               values=frame,
+                               values=values,
                                error="transport raised %s: %s"
                                      % (type(exc).__name__, exc))
-        return self._judge(int(address), frame, response)
+        return self._judge(int(address), values, response)
 
     def close(self) -> None:
         """Close the port. Never raises -- a failed close must not mask a run's result."""
@@ -350,6 +460,23 @@ class SerialLink:
                 self._emit("close failed: %s" % exc, "warn")
         self._open = False
         self._settle_deadline = 0.0
+
+    def _safe_close_transport(self) -> None:
+        """Close a transport whose open FAILED, without raising (F10).
+
+        The connect() call already asserted DTR and reset the MCU; if it then
+        raised or reported failure, a handle may be half-open. Close it so a
+        partially-opened port is not left behind, and do not let a failure here
+        mask the open failure being reported.
+        """
+        self._open = False
+        self._settle_deadline = 0.0
+        if self._transport is None:
+            return
+        try:
+            self._transport.close()
+        except Exception as exc:                                    # noqa: BLE001
+            self._emit("close after failed open also failed: %s" % exc, "warn")
 
     def __enter__(self) -> SerialLink:
         self.open()
@@ -400,6 +527,8 @@ class SerialLink:
         echo_count = getattr(response, "count", None)
         echo_address = int(echo_address) if isinstance(echo_address, int) else None
         echo_count = int(echo_count) if isinstance(echo_count, int) else None
+        function_code = getattr(response, "function_code", None)
+        function_code = int(function_code) if isinstance(function_code, int) else None
         is_error = False
         checker = getattr(response, "isError", None)
         if callable(checker):
@@ -414,6 +543,23 @@ class SerialLink:
         if is_error:
             problems.append("the device returned a Modbus exception response (%r)"
                             % (response,))
+        # F11: a matching address/count is NOT enough. A confirmation must be an
+        # FC16 write-multiple-registers response. This firmware is known to
+        # return MALFORMED exception frames (function code 0x81 where an FC3
+        # exception must be 0x83), so an echo that happens to line up on address
+        # and count while carrying a non-FC16 function code is a FAILED write,
+        # never a confirmed one.
+        if function_code is None:
+            problems.append(
+                "the response carried no function code, so it cannot be confirmed "
+                "as an FC16 (0x%02X) write-multiple-registers response" % _FC16)
+        elif function_code != _FC16:
+            problems.append(
+                "the response function code is 0x%02X, not the FC16 "
+                "write-multiple-registers code 0x%02X -- a value with the high bit "
+                "set is a Modbus exception response, and this firmware is known to "
+                "return malformed exception frames (0x81 for an FC3 error)"
+                % (function_code, _FC16))
         if echo_address is None:
             problems.append("the response echoed no start address")
         elif echo_address != address:
@@ -443,19 +589,26 @@ class SerialLink:
 # ---------------------------------------------------------------------------
 
 class _FakeResponse:
-    """Stands in for a write-multiple-registers response."""
+    """Stands in for a write-multiple-registers response.
 
-    def __init__(self, address: int, count: int, error: bool = False) -> None:
+    ``function_code`` defaults to the real FC16 (0x10). A test that sets it to a
+    malformed value (e.g. 0x81) reproduces this firmware's known bad exception
+    frames, which :meth:`SerialLink._judge` must judge FAILED (F11).
+    """
+
+    def __init__(self, address: int, count: int, error: bool = False,
+                 function_code: int = _FC16) -> None:
         self.address = address
         self.count = count
+        self.function_code = function_code
         self._error = error
 
     def isError(self) -> bool:  # noqa: N802 - the vendor spelling
         return self._error
 
     def __repr__(self) -> str:
-        return "_FakeResponse(address=%r, count=%r, error=%r)" % (
-            self.address, self.count, self._error)
+        return "_FakeResponse(address=%r, count=%r, function_code=0x%02X, error=%r)" % (
+            self.address, self.count, self.function_code, self._error)
 
 
 class FakeSerial:
@@ -473,12 +626,15 @@ class FakeSerial:
 
     def __init__(self, *, fail_open: bool = False, fail_write: bool = False,
                  error_response: bool = False, echo_address: int | None = None,
-                 echo_count: int | None = None) -> None:
+                 echo_count: int | None = None, function_code: int = _FC16) -> None:
         self.fail_open = fail_open
         self.fail_write = fail_write
         self.error_response = error_response
         self.echo_address = echo_address
         self.echo_count = echo_count
+        #: Function code the fake echoes. Default FC16; set to 0x81 to reproduce
+        #: this firmware's known malformed exception frame (F11).
+        self.function_code = function_code
         self.open_count = 0
         self.close_count = 0
         self.connected = False
@@ -507,7 +663,8 @@ class FakeSerial:
             raise OSError("FakeSerial: write failed (fail_write)")
         echo_address = address if self.echo_address is None else self.echo_address
         echo_count = len(frame) if self.echo_count is None else self.echo_count
-        return _FakeResponse(echo_address, echo_count, self.error_response)
+        return _FakeResponse(echo_address, echo_count, self.error_response,
+                             function_code=self.function_code)
 
 
 __all__ = ["FakeSerial", "SerialLink", "WriteResult"]
