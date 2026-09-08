@@ -19,6 +19,14 @@ Pillow>=10.0
 # WINDOWS Python interpreter, not this one, and are installed there -- do not
 # add them here or the WSL install will fail.
 
+# Modbus + serial, for the enclosure PLC (Modbus TCP) and the circulator board
+# (Modbus RTU). Pinned like the arm SDK, because the API moved under us:
+# pymodbus 3.15 RENAMED the `slave=` keyword to `device_id=` and REMOVED
+# ModbusSlaveContext. Downgrading breaks every caller in tools/environment/ and
+# tools/circulator/ -- change the pin and the callers in the same commit.
+pymodbus==3.15.0
+pyserial==3.5
+
 # Linting and the test suites live in dev/ and are not needed to run a phase:
 #   pip install ruff==0.15.18
 #   dev/lint.sh ; dev/test.sh

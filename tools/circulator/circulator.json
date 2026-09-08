@@ -1,0 +1,68 @@
+{
+  "device": "circulator",
+  "model": "UNKNOWN (custom MCU; 'RW-3' was a source comment, not a model)",
+  "model_note": "The string RW-3 in the prior code was a MATLAB cell-divider comment -- a section name written beside '%% PLC' and '%% video' -- and is NOT a model number. Exhaustive search found no firmware source, no schematic, no register map and no BOM. No commercial documentation applies to this board.",
+  "function": "Temperature setpoint sink. Write-only.",
+  "port": null,
+  "port_note": "TODO(operator): record the device path (e.g. /dev/ttyUSB0) after the FTDI bridge is attached to WSL. The prior code used the Windows name COM3, which does not carry over.",
+  "serial": {
+    "baudrate": 9600,
+    "parity": "N",
+    "parity_note": "Must be written QUOTED in config.yaml. An unquoted N parses to boolean False -- the repo parser reads YAML 1.1 false-words {false, no, off, n}. Accepted values are N, E, O only; mark/space are excluded as unverifiable on this board.",
+    "stopbits": 1,
+    "bytesize": 8,
+    "timeout_s": 1.0,
+    "provenance": "verbatim from the prior working code: ModbusSerialClient('COM3', baudrate=9600, parity='N', stopbits=1, bytesize=8, timeout=1)"
+  },
+  "protocol": "Modbus RTU over serial",
+  "unit_id": 1,
+  "unit_id_provenance": "inference (library default; never specified in prior code)",
+  "setpoint": {
+    "address": 980,
+    "addressing": "0-based holding register",
+    "count": 4,
+    "function_code": 16,
+    "payload": "IEEE-754 float64, byteorder LITTLE, wordorder LITTLE",
+    "units": "degrees Celsius",
+    "example": "25.0 -> [0x0000, 0x0000, 0x0000, 0x3940] at 980..983",
+    "provenance": "INFERRED (prior working code only; official meaning unverified)",
+    "warning": "This is NOT the PLC's encoding. The PLC uses float32, byteorder BIG, wordorder LITTLE. Two devices, two encodings -- conflating them produces a well-formed frame carrying a meaningless value, and neither protocol will complain."
+  },
+  "command_bound_c": {
+    "min": 10.0,
+    "max": 30.0,
+    "interval": "OPEN -- strictly min < value < max; exactly 10.0 and exactly 30.0 are REFUSED",
+    "provenance": "MIN IS MEASURED, MAX IS STILL INFERRED -- the two halves no longer share a provenance. min=10.0 was read from the LIVE PLC's `DF21 Temp Output LB` on 2026-09-07 (read-only, five samples, read_holding_registers(28672, count=46), device_id=1, C1 PID Auto OFF, nothing written). The PLC clamps its own temperature-PID output to [10.0, 30.0] C, so that is the range the circulator can legitimately receive. max=30.0 remains INFERRED from the prior system's observed output envelope across all 49,147 logged rows (T output in [0.000, 30.000]); it agrees with the measured DF20 Temp Output UB, but the log envelope on its own is not independent evidence.",
+    "superseded": "min was 0.0 until 2026-09-07, INFERRED from the low end of that same log envelope. THE INFERENCE WAS WRONG: the log floor of 0.000 was the prior system's own behaviour, not the PLC's clamp, and the live PLC clamps at 10.0. Do not restore 0.0 from any log-derived argument -- the measurement outranks it.",
+    "code_ceiling_note": "tools/circulator/safety.py still carries COMMAND_MIN_C = 0.0 as the widest RANGE the layer will permit, and configs/config.yaml TIGHTENS it to 10.0. The ceiling was left alone deliberately: raising it is a hardware-clearance decision about a board whose own protections are unknown, and DF21 is a fact about the PLC's output, not about what this board tolerates. TODO(operator): decide whether the code ceiling should also become 10.0.",
+    "saturation_artifact": "The 2026-01-11 log ends with the temperature output pinned at exactly 30.000 while the measured temperature read 11.4 C -- saturated against the clamp during an aborted run. So 30.000 is a value the BROKEN system produced, which makes it the worst candidate for a legal command.",
+    "why_strict": "The MATLAB original enforced Temp SP in (0, 30) as an open interval, refusing exactly 0.0 and 30.0; and the PLC-side setpoint guard is strict too, so no caller has to remember which device behaves which way at its limits. The strictness is unchanged by the measurement: exactly 10.0 is refused for the same reason exactly 30.0 is -- a value sitting precisely on a clamp is what a saturated controller emits.",
+    "why_ours": "The board is custom and undocumented, so whether it has an over-temperature cutoff or a setpoint clamp of its own is UNKNOWABLE. Every bound that exists is in tools/circulator/safety.py.",
+    "do_not_mirror": "tools/environment/registers.py carries valid_min/valid_max checked INCLUSIVELY, but those are the PLC's SENSOR SCALING bounds (0..100 %RH, -40..180 C) where an exact 100.0 is a legitimate reading. A command bound is a different quantity and is exclusive. CommandLimits is the single source of truth for what may be sent here.",
+    "measured_clamps": "tools/environment/registers.py MEASURED_OUTPUT_CLAMPS holds all four PLC output clamps as read on 2026-09-07: DF20 Temp Output UB=30.0 C, DF21 Temp Output LB=10.0 C, DF22 RH Output UB=100.0 %, DF23 RH Output LB=0.0 %. Only the temperature pair bears on this device -- humidity never transits this host."
+  },
+  "usb": {
+    "busid": "2-1",
+    "bridge": "FTDI FT232R",
+    "vid_pid": "0403:6001",
+    "note": "opening the port asserts DTR and resets the MCU",
+    "attach": [
+      "usbipd bind --busid 2-1",
+      "usbipd attach --wsl --busid 2-1"
+    ],
+    "attach_note": "TODO(operator): both commands need Windows admin. The device is currently NOT attached to WSL and is not visible to Linux.",
+    "boot_settle_s": 3.0,
+    "boot_settle_provenance": "TODO(operator): NOT measured on this board -- no firmware source or schematic exists to derive it from, and the port has never been opened. 3.0 s is a conventional generous allowance for an AVR-class bootloader plus application start."
+  },
+  "unknown": [
+    "mixing / stirrer registers -- MEANING UNKNOWN, no address established",
+    "flow registers -- MEANING UNKNOWN, no address established",
+    "RPM registers -- MEANING UNKNOWN, no address established",
+    "read-back of any kind: no temperature, no status word, no alarm. The prior code's only read was COMMENTED OUT. Do not add one on the assumption that a controller must have one.",
+    "status / fault reporting -- none observed",
+    "DB9 signal assignment on the board side -- TODO(operator): trace it, and confirm whether DTR can be left deasserted",
+    "whether the firmware clamps or range-checks the setpoint at all",
+    "official meaning of address 980, and of every neighbouring address",
+    "the true unit/slave id (1 is the library default, never confirmed)"
+  ]
+}

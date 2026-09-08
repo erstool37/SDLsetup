@@ -39,6 +39,14 @@ What conflicts with what
 * every instrument excludes **itself** -- two processes must not drive one
   device, whether that is the arm's controller or the camera's USB endpoint.
 * ``microscope`` conflicts with nothing but itself; the cameras do not move.
+* ``environment`` conflicts with nothing but itself. The CLICK PLC does not
+  move, but the self-conflict is load-bearing all the same: **the PLC accepts
+  at most three concurrent Modbus TCP clients and refuses the fourth**, so two
+  processes opening supervisor sessions is how a run loses its connection.
+* ``circulator`` conflicts with nothing but itself, for a sharper reason:
+  **opening its serial port hardware-resets the MCU** (FT232R with DTR wired to
+  /RESET; the OS asserts DTR on open, before any byte is sent). A second
+  process opening the port reboots the board under the first one.
 
 Adding an instrument that occupies space means adding it here. An instrument
 missing from the table conflicts only with itself, which is the safe default
@@ -77,6 +85,12 @@ CONFLICTS: dict[str, frozenset[str]] = {
     "uv_vis": frozenset({"arm"}),
     # The cameras do not move; they contend only for their own USB endpoint.
     "microscope": frozenset(),
+    # The CLICK PLC does not move. It contends for its own session: only three
+    # concurrent Modbus TCP clients are accepted, and the fourth is refused.
+    "environment": frozenset(),
+    # The bath does not move either -- but opening its serial port resets the
+    # MCU, so a second opener reboots the board under the first.
+    "circulator": frozenset(),
 }
 
 #: A claim older than this with a live PID is reported as long-running rather

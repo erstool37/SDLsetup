@@ -161,3 +161,134 @@ data:
   # committed. Point this elsewhere (an external disk, say) if it outgrows the
   # machine.
   root: dataset
+
+
+environment:
+  # AutomationDirect CLICK PLC. It runs two hand-written ladder PID loops -- one
+  # for enclosure temperature, one for relative humidity -- reads the two 4-20 mA
+  # sensors, and computes both outputs itself. THIS LAYER IS A SUPERVISOR: it
+  # reads sensors and writes setpoints. It does not close the loop.
+
+  # Master gate. False (the default) means no setpoint write and no PID enable
+  # ever leaves this process -- every operation is a printed dry-run plan.
+  allow_actuation: false
+
+  # Static link-local address taken from the PLC project file; DHCP is off on
+  # the CLICK, so this does not move. Modbus TCP on the standard port 502.
+  host: 169.254.33.33
+  port: 502
+  # INFERENCE, not documented: the prior code never set a unit id, so this is
+  # the pymodbus library default rather than a value read off the PLC.
+  device_id: 1
+  timeout_s: 2.0
+
+  # Setpoint bounds. The MATLAB GUI this replaced refused anything outside
+  # (0, 30) degC and (0, 100) %RH STRICTLY; the Python port that came after it
+  # dropped every bound, which is the defect these keys exist to fix.
+  # They are CODE CEILINGS: config may tighten them, never loosen them.
+  temp_sp_min_c: 0.0
+  temp_sp_max_c: 30.0
+  rh_sp_min_pct: 0.0
+  rh_sp_max_pct: 100.0
+
+  # Largest single setpoint jump accepted without an explicit allow_large_step.
+  # CHOSEN, UNMEASURED -- there is no measurement saying 5 degC is safe and 6 is
+  # not. It exists so a typo (25 -> 2.5, or a units mix-up) is refused instead
+  # of driving the loop across its whole range in one write.
+  max_setpoint_step_c: 5.0
+  max_setpoint_step_pct: 10.0
+
+  # Minimum seconds between two setpoint writes. CHOSEN: it stops a runaway
+  # script from hammering the PLC, which matters more here than usual because
+  # the CLICK has only three Modbus TCP sockets to spend.
+  min_setpoint_interval_s: 10.0
+
+  # Supervisor loop cadence. The prior Python ran at 1 s; the MATLAB original
+  # used 3 s. 1 s is kept so behaviour matches the system being replaced.
+  relay_period_s: 1.0
+
+  # No good PLC read for this long -> force the safe setpoint, turn the PID off,
+  # and RAISE. The prior system had no watchdog at all: on comms loss it kept
+  # forwarding the last value, and a real log from 2026-01-11 ends with the
+  # temperature output saturated at 30.000 while measured temperature read
+  # 11.4 degC. Holding a saturated maximum is the hazard this key prevents.
+  plc_stale_s: 5.0
+
+  # The CLICK accepts at most 3 concurrent Modbus TCP clients and refuses a 4th,
+  # so the dashboard must NOT hold a session of its own while a run is going.
+  # It renders the state the run publishes instead of polling the PLC.
+  dashboard_poll_plc: false
+
+circulator:
+  # Custom MCU board on Modbus RTU over a serial line. It is the temperature
+  # loop's ACTUATOR: it receives the PLC's temperature-PID output as its bath
+  # setpoint. It does not decide anything.
+
+  # Master gate. Opening the port is itself an actuating event: the FT232R has
+  # DTR wired to /RESET and the OS asserts DTR on open, before any byte is sent,
+  # so the MCU hardware-resets. Nothing opens the port while this is false.
+  allow_actuation: false
+
+  # WSL device path. Empty on purpose -- it depends on which busid was attached
+  # this session and inventing one would open the wrong device.
+  # TODO(operator): set after `usbipd attach --wsl --busid 2-1` (e.g. /dev/ttyUSB0).
+  port:
+
+  # Serial framing, as the board is wired. "N" is QUOTED deliberately: this
+  # file's parser reads YAML 1.1 booleans, so a bare N would become False.
+  baudrate: 9600
+  parity: "N"
+  stopbits: 1
+  bytesize: 8
+  timeout_s: 1.0
+  # INFERENCE: the prior code never set a unit id. Not read off the board.
+  # Spelled unit_id, matching CirculatorSettings and circulator.json. It was
+  # `device_id` here until 2026-09-07 -- a DEAD KEY: the code only ever resolved
+  # `unit_id`, so the file said 1 and was never consulted. The environment
+  # section next door really is `device_id`, which is how they diverged.
+  unit_id: 1
+
+  # Seconds to wait after opening the port -- i.e. after the MCU reset that
+  # opening causes -- before the first frame. CHOSEN, UNMEASURED: no boot time
+  # was ever recorded for this board, and a frame sent into a booting MCU is a
+  # silent timeout that looks like bad wiring.
+  boot_settle_s: 3.0
+
+  # Accepted command range, EXCLUSIVE of both endpoints: 10.0 < v < 30.0.
+  #
+  # command_min_c is MEASURED, not inferred. Read from the live PLC's
+  # `DF21 Temp Output LB` on 2026-09-07 (read-only, five samples, device_id=1,
+  # PID Auto OFF): it is 10.0. This supersedes the earlier 0.0, which was
+  # INFERRED from the saturation envelope of the prior system's logs -- and that
+  # inference was WRONG. The PLC clamps its own temperature-PID output to
+  # [10.0, 30.0] C, so 10.0..30.0 is the range the circulator can legitimately
+  # receive; anything outside it is a fault upstream, not a setpoint.
+  #
+  # command_max_c stays INFERRED from those same 49,147 logged rows, and 30.000
+  # in particular is a value the BROKEN system emitted while saturated. The two
+  # halves of this range no longer have the same provenance -- see
+  # tools/circulator/safety.py and tools/environment/registers.py.
+  #
+  # These TIGHTEN the code ceiling in tools/circulator/safety.py; config may
+  # never widen it.
+  command_min_c: 10.0
+  command_max_c: 30.0
+
+  # Where the bath is commanded on comms loss. REQUIRED, and there is no code
+  # default on purpose: a safe setpoint nobody declared is not safe, so the
+  # settings dataclass raises while this is unset rather than picking one.
+  #
+  # It must lie strictly inside the command range above, i.e. 10.0 < v < 30.0
+  # now that command_min_c is the measured 10.0. NOTE: RelayPolicy validates
+  # this against CommandLimits() -- the CODE CEILING (0, 30) -- not against the
+  # tightened config range, so a value in (0, 10] would be accepted at policy
+  # construction and then REFUSED during an abort. scripts/environment/
+  # hold_environment.py re-checks it against the resolved range before the loop
+  # starts, which closes the gap for that script only.
+  # TODO(operator): declare the comms-loss safe bath setpoint, in degC,
+  # strictly inside (10.0, 30.0).
+  safe_setpoint_c:
+
+  # No verified write for this long -> turn the PID off and RAISE. Same absent
+  # watchdog, same 2026-01-11 saturated-output log, as environment.plc_stale_s.
+  circ_stale_s: 5.0

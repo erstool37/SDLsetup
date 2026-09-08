@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from tools.arm import ArmNode
 from tools.cctv import CctvNode
+from tools.circulator import CirculatorNode
 from tools.environment import EnvironmentNode
 from tools.microscope import CameraNode
 from tools.opentrons import OpentronsNode
@@ -25,6 +26,12 @@ def build_lab(allow_arm_motion: bool = False,
     # BMG SPECTROstar Nano; plate-carrier motion gated like the arm.
     lab.register(UvVisNode(allow_uv_vis_motion=allow_uv_vis_motion))
     lab.register(OpentronsNode())                    # vacant
-    lab.register(EnvironmentNode())                  # vacant
+    # CLICK PLC supervisor: reads sensors, writes the two setpoints. It renders
+    # the reading a run published rather than polling -- the CLICK accepts only
+    # three concurrent Modbus TCP clients. No enable_pid on this surface.
+    lab.register(EnvironmentNode())
+    # The temperature loop's actuator, downstream of the PLC. No open/close on
+    # this surface: opening its serial port hardware-RESETS the MCU.
+    lab.register(CirculatorNode())
     lab.register(CctvNode())                         # vacant
     return lab

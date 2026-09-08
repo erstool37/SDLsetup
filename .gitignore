@@ -50,6 +50,10 @@ dataset/
 # when absent -- see dev/tests/fixtures/README.md.
 dev/tests/fixtures/*
 !dev/tests/fixtures/README.md
+# Small measured JSON captures ARE tracked: they are known-answer inputs
+# (a few kB) and a known-answer test that skips on a fresh clone is a test
+# nobody runs. Images and bulk stay ignored by the rule above.
+!dev/tests/fixtures/*.json
 
 # Lab data and large artifacts
 #   Collected run data lives OUTSIDE the repo (config.yaml -> data.root,

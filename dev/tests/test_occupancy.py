@@ -122,5 +122,42 @@ ok("age_s" in state["arm"] and "pid" in state["arm"],
    "the panel gets how long and which process")
 ok(occupancy.status()["arm"]["busy"] is False, "and idle again afterwards")
 
+print("\n--- the PLC and the circulator are registered, and self-exclude ---")
+ok("environment" in occupancy.CONFLICTS, "environment is in the policy table")
+ok("circulator" in occupancy.CONFLICTS, "circulator is in the policy table")
+ok(occupancy.CONFLICTS["environment"] == frozenset(),
+   "environment conflicts with nothing else -- the PLC does not move")
+ok(occupancy.CONFLICTS["circulator"] == frozenset(),
+   "circulator conflicts with nothing else -- the bath does not move")
+
+print("\n--- but each still excludes ITSELF, which is the point ---")
+# The PLC refuses a 4th concurrent Modbus TCP client, so a second supervisor
+# session is how a run loses its connection.
+with occupancy.claim("environment", doing="setpoint relay"):
+    blocked(lambda: occupancy.require_free("environment"),
+            "a second PLC session is refused (only 3 TCP clients exist)")
+    occupancy.require_free("circulator")
+    ok(True, "the circulator is unaffected -- different interface")
+    occupancy.require_free("arm")
+    ok(True, "and the arm is unaffected -- no shared bench space")
+
+# Opening the circulator's serial port asserts DTR, which is wired to /RESET:
+# a second opener reboots the MCU under the first.
+with occupancy.claim("circulator", doing="bath setpoint write"):
+    blocked(lambda: occupancy.require_free("circulator"),
+            "a second port open is refused (opening resets the MCU)")
+    occupancy.require_free("environment")
+    ok(True, "the PLC is unaffected by the circulator being busy")
+    occupancy.require_free("arm")
+    ok(True, "and so is the arm")
+
+print("\n--- and neither blocks, nor is blocked by, the arm ---")
+with occupancy.claim("arm", doing="plate transport"):
+    occupancy.require_free("environment")
+    occupancy.require_free("circulator")
+    ok(True, "a moving arm does not stop the enclosure or the bath")
+ok(occupancy.current("environment") is None and occupancy.current("circulator") is None,
+   "no claim left behind for either")
+
 print("\n%s" % ("ALL PASS" if failures == 0 else "%d FAILURE(S)" % failures))
 sys.exit(1 if failures else 0)
