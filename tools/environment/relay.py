@@ -78,6 +78,7 @@ from typing import Any
 from .. import config as _config
 from ..circulator import api as _circ
 from . import registers
+from . import safety as _safety
 from .reading import EnvironmentReading
 from .safety import CommsLost
 
@@ -388,10 +389,32 @@ class Relay:
         self.last_record: RelayRecord | None = None
         self._bad_since: float | None = None
         self._write_bad_since: float | None = None
+        #: Last value the injected clock returned, so a non-finite or backward
+        #: reading is caught rather than silently disabling the watchdogs (F9).
+        self._last_clock: float | None = None
         #: The last value handed over, used ONLY for the large-step quality
         #: flag. It is never re-sent: "hold the last value" is the 2026-01-11
         #: failure mode, where a saturated 30.000 was forwarded for hours.
         self._last_value: float | None = None
+
+    def _read_clock(self) -> float:
+        """The injected clock, validated finite and monotonic.
+
+        A broken clock is a broken invariant, so this raises loudly rather than
+        letting a NaN or a backward jump quietly stop a watchdog from firing.
+        Matches the clock discipline in :meth:`RateLimiter.check`.
+        """
+        now = float(self._clock())
+        if not math.isfinite(now):
+            raise _safety.SafetyError(
+                "relay clock returned a non-finite value (%r); refusing to run a "
+                "watchdog on a clock that cannot measure elapsed time" % now)
+        if self._last_clock is not None and now < self._last_clock:
+            raise _safety.SafetyError(
+                "relay clock went backward (%r -> %r); a watchdog cannot trust "
+                "negative elapsed time" % (self._last_clock, now))
+        self._last_clock = now
+        return now
 
     # -- one iteration ----------------------------------------------------
     def step(self) -> RelayRecord:
@@ -404,7 +427,7 @@ class Relay:
         phase script must see; swallowing either would leave the loop running on
         a state nobody observed.
         """
-        now = float(self._clock())
+        now = self._read_clock()
         reading = self.env.read_block()
         value = reading.channels.get(SOURCE_CHANNEL)
         reason = self._why_unusable(reading, value)

@@ -46,7 +46,7 @@ from tools.circulator.api import SafetyError as CircSafetyError  # noqa: E402
 from tools.environment import registers  # noqa: E402
 from tools.environment.plc import FakePlc, PlcClient, PlcSettings  # noqa: E402
 from tools.environment.relay import Relay, RelayPolicy  # noqa: E402
-from tools.environment.safety import CommsLost  # noqa: E402
+from tools.environment.safety import CommsLost, SafetyError  # noqa: E402
 
 fails = 0
 
@@ -336,6 +336,15 @@ try:
     ok(back["quality"]["large_step"] is False, "and the quality flags")
 except (TypeError, ValueError) as exc:
     ok(False, "json.dumps(record.as_dict()) round-trips", str(exc))
+
+print("\n--- F9: a non-finite or backward clock cannot silently disable a watchdog ---")
+relay, _f9a, _l9a = build(clock=lambda: float("nan"))
+raises(SafetyError, relay.step, "a NaN clock is refused, not silently ignored")
+
+_seq = iter([1000.0, 990.0, 990.0])
+relay, _f9b, _l9b = build(clock=lambda: next(_seq))
+relay.step()  # t=1000, good read, forwards normally
+raises(SafetyError, relay.step, "a backward clock jump is refused")
 
 print("\n%s" % ("ALL PASS" if fails == 0 else "%d FAILURE(S)" % fails))
 sys.exit(1 if fails else 0)
