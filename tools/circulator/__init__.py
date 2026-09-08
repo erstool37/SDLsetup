@@ -1,5 +1,18 @@
 """Custom MCU circulator -- temperature SETPOINT ONLY, write-only, no read-back.
 
+Common entry points
+===================
+Most callers need only:
+
+* :class:`Circulator` (``from_config``, ``bound``, ``write_setpoint``) -- the bath.
+* :class:`CirculatorSettings` -- its resolved settings and command bound.
+* :class:`FakeSerial` -- the only transport a test may use.
+
+Do not drive the bath by hand for a run. ``scripts/environment/start_kinetics.py``
+is THE full-run entry point and ``scripts/environment/check_environment.py`` the
+status read; both reach the bath through the relay's pre-declared fail-safe.
+
+
 .. danger::
 
    **OPENING THE SERIAL PORT HARDWARE-RESETS THE MICROCONTROLLER.** The board
@@ -47,13 +60,7 @@ from .api import (
     COMMAND_MAX_C,
     COMMAND_MIN_C,
     CONFIG_SECTION,
-    DEFAULT_BAUDRATE,
-    DEFAULT_BOOT_SETTLE_S,
-    DEFAULT_BYTESIZE,
-    DEFAULT_PARITY,
-    DEFAULT_STOPBITS,
     DEFAULT_TIMEOUT_S,
-    DEFAULT_UNIT_ID,
     INVENTORY_PATH,
     SETPOINT_ADDRESS,
     SETPOINT_COUNT,
@@ -76,13 +83,7 @@ __all__ = [
     "COMMAND_MAX_C",
     "COMMAND_MIN_C",
     "CONFIG_SECTION",
-    "DEFAULT_BAUDRATE",
-    "DEFAULT_BOOT_SETTLE_S",
-    "DEFAULT_BYTESIZE",
-    "DEFAULT_PARITY",
-    "DEFAULT_STOPBITS",
     "DEFAULT_TIMEOUT_S",
-    "DEFAULT_UNIT_ID",
     "INVENTORY_PATH",
     "SETPOINT_ADDRESS",
     "SETPOINT_COUNT",

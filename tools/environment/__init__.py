@@ -1,5 +1,18 @@
 """Enclosure temperature and humidity — an AutomationDirect CLICK PLC over Modbus TCP.
 
+Common entry points
+===================
+Most callers need only a handful of names here:
+
+* :func:`read` / :func:`diagnostics` / :func:`pid_enabled` -- read the chamber.
+* :func:`set_temperature` / :func:`set_humidity` -- write a setpoint (gated).
+* :class:`Relay` + :class:`RelayPolicy` -- the PLC->bath forward, run by a script.
+
+Do not wire a whole run by hand. ``scripts/environment/start_kinetics.py`` is THE
+full-run entry point (setpoints, PID, hold loop, fail-safe), and
+``scripts/environment/check_environment.py`` is the zero-actuation status read.
+
+
 The PLC runs **two hand-written ladder PID loops** — one for enclosure
 temperature, one for relative humidity — reads the two 4-20 mA sensors, and
 computes both outputs itself. **This package is a supervisor, not a controller:**
@@ -62,13 +75,10 @@ from .api import (
     CONFIG_SECTION,
     CONFIRMED,
     COOPERATIVE_WATCHDOG_RESIDUAL,
-    DEFAULT_DEVICE_ID,
     DEFAULT_HOST,
     DEFAULT_PORT,
     DF_BASE,
     FAILED,
-    MAX_CONCURRENT_CLIENTS,
-    NATIVE_DIAGNOSTICS,
     PLANNED,
     REGISTERS,
     UNKNOWN_DF,
@@ -121,13 +131,10 @@ __all__ = [
     "CONFIG_SECTION",
     "CONFIRMED",
     "COOPERATIVE_WATCHDOG_RESIDUAL",
-    "DEFAULT_DEVICE_ID",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "DF_BASE",
     "FAILED",
-    "MAX_CONCURRENT_CLIENTS",
-    "NATIVE_DIAGNOSTICS",
     "PLANNED",
     "REGISTERS",
     "UNKNOWN_DF",

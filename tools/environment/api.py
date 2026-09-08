@@ -1,5 +1,18 @@
 """The environment package's public surface. Everything callable from outside is here.
 
+Common entry points
+===================
+Most callers need only a handful of names here:
+
+* :func:`read` / :func:`diagnostics` / :func:`pid_enabled` -- read the chamber.
+* :func:`set_temperature` / :func:`set_humidity` -- write a setpoint (gated).
+* :class:`Relay` + :class:`RelayPolicy` -- the PLC->bath forward, run by a script.
+
+Do not wire a whole run by hand. ``scripts/environment/start_kinetics.py`` is THE
+full-run entry point (setpoints, PID, hold loop, fail-safe), and
+``scripts/environment/check_environment.py`` is the zero-actuation status read.
+
+
 A caller reaching past this module into ``registers``, ``reading``, ``safety``,
 ``plc`` or ``relay`` is a signal, not a shortcut: either this surface is missing
 something and should gain it deliberately, or the caller is about to reimplement
@@ -80,12 +93,9 @@ from ..circulator.api import SafetyError as CirculatorSafetyError
 from .node import EnvironmentNode
 from .plc import (
     CONFIRMED,
-    DEFAULT_DEVICE_ID,
     DEFAULT_HOST,
     DEFAULT_PORT,
     FAILED,
-    MAX_CONCURRENT_CLIENTS,
-    NATIVE_DIAGNOSTICS,
     PLANNED,
     FakePlc,
     PlcClient,
@@ -312,13 +322,10 @@ __all__ = [
     "CONFIG_SECTION",
     "CONFIRMED",
     "COOPERATIVE_WATCHDOG_RESIDUAL",
-    "DEFAULT_DEVICE_ID",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "DF_BASE",
     "FAILED",
-    "MAX_CONCURRENT_CLIENTS",
-    "NATIVE_DIAGNOSTICS",
     "PLANNED",
     "REGISTERS",
     "UNKNOWN_DF",
