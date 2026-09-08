@@ -292,7 +292,15 @@ class Circulator:
     # -- observation ------------------------------------------------------
     @property
     def link(self) -> SerialLink:
-        """The transport session. Reading it never builds or opens anything."""
+        """The transport session. Reading it never builds or opens anything.
+
+        H8: this hands out the GUARDED :class:`~.link.SerialLink` wrapper, whose
+        write path takes only a canonical codec-built frame (H3) and whose raw
+        vendor client is now private (``SerialLink._transport``). The token/frame
+        guards prevent ACCIDENTAL misuse, not a determined caller using private
+        names or ``object.__setattr__``. (This accessor is not itself renamed
+        private, because the dashboard node reads ``link.is_open`` through it.)
+        """
         return self._link
 
     @property
@@ -340,8 +348,12 @@ class Circulator:
         # (e.g. (0, 30) while this run's bound is (10, 30)) must not be trusted
         # blindly across the boundary -- re-validate its value against the
         # receiving client's own bound, which raises if it is outside.
-        self.limits.validate(sp.value_c)
-        values = encode_setpoint(sp.value_c)
+        # H4: snapshot the token's value ONCE, then use only the local. A
+        # subclass with a stateful __getattribute__ could otherwise pass the
+        # re-validation below and hand a DIFFERENT value to the encoder.
+        value_c = sp.value_c
+        self.limits.validate(value_c)
+        values = encode_setpoint(value_c)
         if not self.settings.allow_actuation:
             # outcome="planned", so `ok` is False: nothing was written, and
             # that is the honest answer. See WriteResult's docstring.
@@ -352,7 +364,7 @@ class Circulator:
         # F2c: the raw wire takes ONLY a private fixed-frame object, built solely
         # by the setpoint codec at the canonical address/count -- never an
         # arbitrary (address, values) pair.
-        return self._link.write_registers(self._link.encode_frame(sp.value_c))
+        return self._link.write_registers(self._link.encode_frame(value_c))
 
     def plan_setpoint(self, sp: BoundedSetpoint) -> dict:
         """What a write would send, without sending it. Never opens the port."""

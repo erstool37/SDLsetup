@@ -371,14 +371,20 @@ def unopened_relay(*, circ_actuation: bool, pid_on: bool = True,
     return rl, fk, ln, dv
 
 
-print("\n--- F1: with the PID loop OFF, DF9 is not forwarded ---")
+print("\n--- H2: with the PID loop OFF, the bath is DRIVEN TO SAFE (not forwarded) ---")
 relay, fake, line = build(pid_on=False)
 rec = relay.step()
 ok(rec.forwarded is False, "C1 off -> DF9 is NOT forwarded (a disabled loop's output is not a command)")
 ok(rec.reason is not None and "OFF" in rec.reason.upper() and "C1" in rec.reason,
    "the reason names the PID coil being off", str(rec.reason)[:70])
-ok(line.frames == [], "and nothing reached the bath")
-ok(relay.safe_mode is False, "this is a plain refusal, not safe mode")
+ok(last_frame_c(line) == SAFE_C,
+   "the bath is driven to the declared safe setpoint, not left on its last command (H2)",
+   "%r" % last_frame_c(line))
+ok(len(line.frames) == 1, "exactly one frame -- the safe setpoint", str(len(line.frames)))
+ok(relay.safe_mode is False, "this is NOT latched safe mode -- a clean PID-off is recoverable")
+rec2 = relay.step()
+ok(len(line.frames) == 1, "a second PID-off step does NOT re-drive: once per episode (H2)")
+ok(rec2.forwarded is False, "still not forwarding while C1 is off")
 
 print("\n--- F1: with the PID coil UNREADABLE (None), DF9 is not forwarded ---")
 relay, fake, line = build(plc={"error_on": {"read_coils"}})

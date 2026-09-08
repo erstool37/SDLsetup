@@ -89,7 +89,7 @@ ok(fake.frames == [], "and no frame reached the transport")
 print("\n--- and never builds a real transport ---")
 lazy = Circulator(CirculatorSettings(port=PORT, allow_actuation=False))
 lazy.write_setpoint(lazy.bound(11.4))
-ok(lazy.link.transport is None,
+ok(lazy.link._transport is None,
    "with allow_actuation off, no transport object is ever constructed")
 ok("pymodbus" not in sys.modules and "serial" not in sys.modules,
    "and no vendor module was imported by doing it")
@@ -97,12 +97,12 @@ ok("pymodbus" not in sys.modules and "serial" not in sys.modules,
 print("\n--- opening is an ACTUATING operation and is gated like one ---")
 off = SerialLink(CirculatorSettings(port=PORT, allow_actuation=False), transport=FakeSerial())
 blocked(off.open, "open() is refused while allow_actuation is off", ActuationNotAllowed)
-ok(off.transport.open_count == 0, "nothing was opened by the refused call")
+ok(off._transport.open_count == 0, "nothing was opened by the refused call")
 
 no_port = SerialLink(CirculatorSettings(port=None, allow_actuation=True),
                      transport=FakeSerial())
 blocked(no_port.open, "open() is refused when no port is configured")
-ok(no_port.transport.open_count == 0, "and again nothing was opened")
+ok(no_port._transport.open_count == 0, "and again nothing was opened")
 
 print("\n--- one open per session, no matter how often it is asked for ---")
 fake = FakeSerial()
@@ -239,8 +239,8 @@ print("\n--- F2c: the raw wire takes ONLY a codec-built frame, not (address, val
 # a 1-register partial write, a PLC-codec pair, NaN bits. Now it takes only a
 # private _SetpointFrame built by encode_frame at the canonical address 980.
 frame = SerialLink.encode_frame(25.0)
-ok(frame.address == SETPOINT_ADDRESS and frame.values == [0, 0, 0, 0x3940],
-   "encode_frame builds the canonical 4-register frame at address 980",
+ok(frame.address == SETPOINT_ADDRESS and frame.values == (0, 0, 0, 0x3940),
+   "encode_frame builds the canonical 4-register frame at address 980 (H3: tuple)",
    "%d %r" % (frame.address, frame.values))
 with SerialLink(live(), transport=FakeSerial()) as link:
     blocked(lambda: link.write_registers(SETPOINT_ADDRESS, [0, 0, 0, 0x3940]),

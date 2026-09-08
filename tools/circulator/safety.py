@@ -190,6 +190,16 @@ class BoundedSetpoint:
     Constructing one directly raises. The whole point is that possession of
     this object is proof the bound was applied, so the transport layer can
     accept it without re-deriving anything.
+
+    **What this immutability does and does not stop (F2a residual).** The
+    token and the frozen attributes stop *accidental* misuse and ordinary
+    assignment -- a caller cannot rebind the value after validation. They do
+    NOT stop a determined caller using ``object.__setattr__`` or a subclass
+    with a stateful ``__getattribute__``; that is true of every Python
+    "immutable", and real enforcement would need a different language or a
+    process boundary. The write sinks snapshot the value once (H4) so a
+    stateful subclass cannot change it between validation and encoding, but
+    this object itself is not a security boundary.
     """
 
     __slots__ = ("value_c", "limits")

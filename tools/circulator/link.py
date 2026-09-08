@@ -54,7 +54,12 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .codec import REGISTER_MAX, SETPOINT_ADDRESS, encode_setpoint
+from .codec import (
+    REGISTER_MAX,
+    SETPOINT_ADDRESS,
+    SETPOINT_COUNT,
+    encode_setpoint,
+)
 from .safety import ActuationNotAllowed, CirculatorError, SafetyError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
@@ -97,14 +102,28 @@ class _SetpointFrame:
 
     __slots__ = ("address", "values")
 
-    def __init__(self, token: object, address: int, values: list[int]) -> None:
+    def __init__(self, token: object, address: int,
+                 values: Sequence[int]) -> None:
         if token is not _FRAME_TOKEN:
             raise SafetyError(
                 "_SetpointFrame() may only be built by SerialLink.encode_frame(); "
                 "constructing one directly would restore the arbitrary "
                 "(address, values) wire path this type exists to remove.")
+        # H3: frozen at construction and values stored as a TUPLE, so a validated
+        # frame cannot afterwards be redirected to another register, truncated to
+        # one, or have its bits rewritten by ordinary assignment.
         object.__setattr__(self, "address", int(address))
-        object.__setattr__(self, "values", list(values))
+        object.__setattr__(self, "values", tuple(int(word) for word in values))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise SafetyError(
+            "_SetpointFrame is immutable: its address and values are frozen when "
+            "encode_frame() builds it, so a validated frame cannot be redirected "
+            "to another register or rewritten to a different value.")
+
+    def __delattr__(self, name: str) -> None:
+        raise SafetyError(
+            "_SetpointFrame is immutable; its attributes cannot be deleted.")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -211,14 +230,11 @@ class SerialLink:
         self._last_event: dict | None = None
 
     # -- observation, which never touches the port ------------------------
-    @property
-    def transport(self) -> Any:
-        """The injected or lazily built transport, or None if none exists yet.
-
-        Reading this NEVER builds one -- a status page must be able to ask.
-        """
-        return self._transport
-
+    # H8: the raw vendor client is a PRIVATE attribute (``_transport``), NOT a
+    # public property -- a determined caller can still reach ``_transport`` (the
+    # point is only that it has left the public surface). ``is_open`` /
+    # ``settle_remaining_s`` / the reset counters are the read-only facts a
+    # status page needs; none of them hands out the write-capable transport.
     @property
     def is_open(self) -> bool:
         return self._open
@@ -491,20 +507,34 @@ class SerialLink:
             self._log_fn(message, level)
 
     def _check_frame(self, address: int, values: Sequence[int]) -> list[int]:
+        # H3: a validated frame must be EXACTLY the canonical setpoint
+        # transaction -- SETPOINT_COUNT (4) registers at SETPOINT_ADDRESS (980).
+        # encode_frame always builds that, but a forged or otherwise non-canonical
+        # frame could carry a different address or count; enforce the shape here
+        # so a one-register, wrong-address, or arbitrary-bit write is refused
+        # rather than sent.
         if isinstance(address, bool) or not isinstance(address, int):
             raise CirculatorError(f"register address must be an int, got {address!r}")
-        if address < 0:
-            raise CirculatorError(f"register address must be non-negative, got {address}")
+        if address != SETPOINT_ADDRESS:
+            raise CirculatorError(
+                f"refusing to write to address {address}: the ONLY established "
+                f"transaction on this board is the setpoint block at "
+                f"{SETPOINT_ADDRESS}. A frame at any other address is not a "
+                f"setpoint and is refused.")
+        frame_words = list(values)
+        if len(frame_words) != SETPOINT_COUNT:
+            raise CirculatorError(
+                f"refusing to write {len(frame_words)} register(s): the setpoint "
+                f"transaction is exactly {SETPOINT_COUNT} registers. A partial or "
+                f"over-long write is not the canonical setpoint frame.")
         frame: list[int] = []
-        for index, raw in enumerate(values):
+        for index, raw in enumerate(frame_words):
             if isinstance(raw, bool) or not isinstance(raw, int):
                 raise CirculatorError(f"register {index}: not an int: {raw!r}")
             if not 0 <= raw <= REGISTER_MAX:
                 raise CirculatorError(
                     f"register {index}: {raw!r} outside 0..0x{REGISTER_MAX:04X}")
             frame.append(raw)
-        if not frame:
-            raise CirculatorError("refusing to write an empty register block")
         return frame
 
     def _unit_kwarg(self) -> str:

@@ -229,7 +229,7 @@ ok(frame.ok is False,
    "and ok is False -- a plan is not a write, so it cannot read as one")
 ok(frame.dry_run is True, "dry_run is derived from the outcome, not stored beside it")
 ok(len(frame.values) == 2, "the dry-run frame is two registers")
-ok(dry.transport is None, "and constructed no transport at all")
+ok(dry._transport is None, "and constructed no transport at all")
 ok("DRY-RUN" in frame.describe(), "and says so when printed")
 
 print("\n--- PID coil: disabling is the safe direction, and is always allowed ---")

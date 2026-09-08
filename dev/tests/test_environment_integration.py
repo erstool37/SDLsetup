@@ -110,9 +110,9 @@ try:
     client = PlcClient(settings)
     ok(client.connect() is True, "a real ModbusTcpClient connected",
        str(client.last_error or ""))
-    ok(type(client.transport).__name__ == "ModbusTcpClient",
+    ok(type(client._transport).__name__ == "ModbusTcpClient",
        "and it really is pymodbus, not the fake",
-       type(client.transport).__name__)
+       type(client._transport).__name__)
 
     print("\n--- the logged row of 2025-07-26 15:52:32, over the wire ---")
     record = client.read_block()

@@ -226,6 +226,18 @@ loop nobody started is a tool that decides, and it is invisible to the run
 record. The residual is exposed as `Relay.COOPERATIVE_WATCHDOG_RESIDUAL` and
 `hold_environment.py` records it into every run via `run.note()`.
 
+### What the setpoint guards do NOT stop (F2a residual)
+
+`BoundedSetpoint` (and the circulator's) is immutable and can only be built by a
+`validate()` call, so possession of one proves a bound ran and ordinary
+reassignment of its value is refused. This stops **accidental** misuse only. It
+does **not** stop a determined caller using `object.__setattr__` or a subclass
+with a stateful `__getattribute__` — that is true of every Python "immutable",
+and real enforcement would need a different language or a process boundary. The
+write sinks snapshot the token's value once (H4) so a stateful subclass cannot
+change it between validation and encoding, but the tokens themselves are
+accidental-misuse aids, not security boundaries.
+
 ## Diagnostics we cannot read
 
 The CLICK's own comms flags exist and their nicknames are known. **Their Modbus

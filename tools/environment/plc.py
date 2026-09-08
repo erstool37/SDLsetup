@@ -19,7 +19,11 @@ Each one was live in the code this replaces, and each has a named test in
    90, 92, 95, 87) happens to have a zero low word. :meth:`PlcClient.write_float32`
    emits exactly one FC16 of exactly two registers, and **this module exposes
    no API capable of a single-register float write at all** -- there is no
-   ``write_register`` method to reach for.
+   ``write_register`` method to reach for. That guard, and the
+   :class:`~.safety.BoundedSetpoint` token, prevent **accidental** misuse only:
+   a determined caller using a private name (the transport is stored as
+   ``_transport``) or ``object.__setattr__`` is NOT stopped -- real enforcement
+   would need a different language or a process boundary.
 
 2. **No write verification.** Every write here is read back and compared
    word-for-word, and a mismatch raises :class:`~.safety.SafetyError`.
@@ -506,7 +510,10 @@ class PlcClient:
 
     def __init__(self, settings: PlcSettings, transport: Any = None) -> None:
         self.settings = settings
-        self.transport = transport
+        # H8: the injected/lazily-built transport is stored PRIVATELY -- the raw
+        # vendor client is not part of the public surface. The constructor arg
+        # still works for injecting a fake; only the attribute name changed.
+        self._transport = transport
         self._owns_transport = transport is None
         #: The last transport fault, verbatim. Read it when a reading came back
         #: with ``read_ok=False`` -- the reading type carries no error field.
@@ -514,18 +521,18 @@ class PlcClient:
 
     # -- session --------------------------------------------------------
     def _ensure_transport(self) -> Any:
-        if self.transport is None:
+        if self._transport is None:
             # Imported HERE, never at module level: the package must import on
             # a machine with no pymodbus and no PLC.
             from pymodbus.client import ModbusTcpClient
 
-            self.transport = ModbusTcpClient(
+            self._transport = ModbusTcpClient(
                 self.settings.host,
                 port=self.settings.port,
                 timeout=self.settings.timeout_s,
                 retries=self.settings.retries,
             )
-        return self.transport
+        return self._transport
 
     def connect(self) -> bool:
         """Open the socket. Returns whether it opened; never raises for a
@@ -542,14 +549,14 @@ class PlcClient:
         return opened
 
     def close(self) -> None:
-        if self.transport is None:
+        if self._transport is None:
             return
         try:
-            self.transport.close()
+            self._transport.close()
         except Exception as exc:                                    # noqa: BLE001
             self.last_error = "close: %s: %s" % (type(exc).__name__, exc)
         if self._owns_transport:
-            self.transport = None
+            self._transport = None
 
     def __enter__(self) -> PlcClient:
         self.connect()
@@ -666,27 +673,35 @@ class PlcClient:
         # WRITABLE spec for its field (a token whose spec is not the canonical
         # one is refused). A token validated under a wider range or redirected to
         # a non-canonical register is not trusted blindly across the boundary.
-        self.settings.limits.validate(sp.field, sp.value)
-        canonical = registers.WRITABLE.get(sp.field)
-        if canonical is None or sp.spec is not canonical:
+        # H4: snapshot field/value/spec ONCE, before re-validation, and use ONLY
+        # these locals for the bound check, the canonical-spec check, encoding,
+        # and address selection. A subclass with a stateful __getattribute__
+        # could otherwise pass validation and then encode a different value or
+        # target a different register.
+        field = sp.field
+        value = sp.value
+        spec = sp.spec
+        self.settings.limits.validate(field, value)
+        canonical = registers.WRITABLE.get(field)
+        if canonical is None or spec is not canonical:
             raise SafetyError(
                 "write_float32(): the setpoint token for %r does not carry the "
                 "canonical WRITABLE register spec for that field (got spec %r). A "
                 "token whose spec was redirected is refused at the sink." %
-                (sp.field, sp.spec))
+                (field, spec))
 
-        low_word, high_word = registers.f32_to_regs(sp.value)
+        low_word, high_word = registers.f32_to_regs(value)
         words = (low_word, high_word)
-        address = sp.spec.address
+        address = spec.address
 
         if dry_run:
             return WriteResult(outcome=PLANNED, address=address, values=words,
-                               field=sp.field, value=sp.value)
+                               field=field, value=value)
         if not self.settings.allow_actuation:
             raise ActuationNotAllowed(
                 "refusing to write %s=%g: environment.allow_actuation is "
                 "false. Pass dry_run=True to see the frame."
-                % (sp.field, sp.value))
+                % (field, value))
 
         try:
             result = self._ensure_transport().write_registers(
@@ -696,38 +711,38 @@ class PlcClient:
                 address, list(words), type(exc).__name__, exc)
             self.last_error = error
             return WriteResult(outcome=FAILED, address=address, values=words,
-                               error=error, field=sp.field, value=sp.value)
+                               error=error, field=field, value=value)
         if result is None or self._is_error(result):
             error = "write_registers(%d, %r): %r" % (address, list(words), result)
             self.last_error = error
             return WriteResult(outcome=FAILED, address=address, values=words,
-                               error=error, field=sp.field, value=sp.value)
+                               error=error, field=field, value=value)
 
         readback = self._read_registers(address, 2)
         if readback is None:
             raise _unverified(
                 WriteResult(outcome=FAILED, address=address, values=words,
                             error="read-back unobtainable: %s" % self.last_error,
-                            field=sp.field, value=sp.value),
+                            field=field, value=value),
                 "wrote %s=%g to %d but could not read it back (%s). An "
                 "unverified write is not a write: the PLC may hold this value, "
                 "the previous one, or half of each."
-                % (sp.field, sp.value, address, self.last_error))
+                % (field, value, address, self.last_error))
         if tuple(readback) != words:
             raise _unverified(
                 WriteResult(outcome=FAILED, address=address, values=words,
                             readback=tuple(readback), error="read-back mismatch",
-                            field=sp.field, value=sp.value),
+                            field=field, value=value),
                 "read-back mismatch at %d for %s=%g: wrote [0x%04X 0x%04X], "
                 "read [%s] (decodes to %r). This is the half-word failure mode: "
                 "the PLC is not holding what was commanded."
-                % (address, sp.field, sp.value, words[0], words[1],
+                % (address, field, value, words[0], words[1],
                    " ".join("0x%04X" % w for w in readback),
                    registers.regs_to_f32(readback[0], readback[1])
                    if len(readback) >= 2 else None))
         return WriteResult(outcome=CONFIRMED, address=address, values=words,
-                           readback=tuple(readback), field=sp.field,
-                           value=sp.value)
+                           readback=tuple(readback), field=field,
+                           value=value)
 
     def set_pid(self, enabled: bool, *, dry_run: bool = False) -> WriteResult:
         """Write coil C1, the PID auto/manual flag.
@@ -812,7 +827,7 @@ class PlcClient:
             }
             for bit, nickname, address in NATIVE_DIAGNOSTICS
         }
-        transport = self.transport
+        transport = self._transport
         connected = getattr(transport, "connected", None)
         return {
             "host": self.settings.host,
@@ -845,7 +860,7 @@ class PlcClient:
     def __repr__(self) -> str:
         return "PlcClient(%s:%d device_id=%d transport=%s)" % (
             self.settings.host, self.settings.port, self.settings.device_id,
-            type(self.transport).__name__ if self.transport is not None else "None")
+            type(self._transport).__name__ if self._transport is not None else "None")
 
 
 # ---------------------------------------------------------------------------
