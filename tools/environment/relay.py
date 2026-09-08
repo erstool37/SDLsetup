@@ -166,10 +166,13 @@ class RelayPolicy:
     plc_stale_s: float = DEFAULT_PLC_STALE_S
     circ_stale_s: float = DEFAULT_CIRC_STALE_S
     large_step_c: float = DEFAULT_LARGE_STEP_C
-    #: The circulator's **resolved** command bound, i.e. after config has
-    #: tightened it. ``None`` falls back to the code ceiling, which is only
-    #: correct when no config narrowed the range. ``from_config`` always
-    #: populates this; a hand-built policy should too.
+    #: The circulator's **resolved** command bound (after config tightening).
+    #: REQUIRED: ``__post_init__`` refuses ``None`` or a non-``CommandLimits``.
+    #: There is deliberately no fallback -- a fallback to the code ceiling is
+    #: WIDER than the resolved bound, which is exactly how a safe setpoint in the
+    #: gap (e.g. 5 C under a (10,30) bound) passed construction and then failed
+    #: during the abort (Codex review A, F8). ``from_config`` populates it; a
+    #: hand-built policy must pass it explicitly.
     command_limits: Any = None
     sources: dict = dataclasses.field(default_factory=dict)
 
@@ -186,6 +189,16 @@ class RelayPolicy:
                 "it is a %s (%r), not a number" % (type(raw).__name__, raw))
         if not math.isfinite(float(raw)):
             raise _unset_safe_setpoint("it is not finite (%r)" % (raw,))
+        # The resolved command bound is required, with NO fallback: falling back
+        # to the code ceiling would validate the safe setpoint against a WIDER
+        # range than the abort path will use (Codex review A, F8).
+        if not isinstance(self.command_limits, _circ.CommandLimits):
+            raise _config.ConfigError(
+                "RelayPolicy.command_limits must be a CommandLimits (the circulator's "
+                "resolved bound), got %r. Build the policy with RelayPolicy.from_config, "
+                "which resolves it, or pass it explicitly -- there is no fallback, because "
+                "a fallback would be wider than the bound the fail-safe actually writes "
+                "within." % (self.command_limits,))
         # The circulator's bound is the authority on what this device may be
         # commanded to. Raising here, at construction, means a run cannot start
         # holding a safe setpoint it could never write.
@@ -224,7 +237,7 @@ class RelayPolicy:
         code ceiling. Never widen: ``CommandLimits`` refuses that at
         construction.
         """
-        return self.command_limits or _circ.CommandLimits()
+        return self.command_limits
 
     # -- construction -----------------------------------------------------
     @classmethod

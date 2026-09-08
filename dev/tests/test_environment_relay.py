@@ -121,7 +121,8 @@ def build(values: dict | None = None, *, clock: Clock | None = None,
     device.open(settle=False)
 
     return (Relay(client, device,
-                  RelayPolicy(safe_setpoint_c=SAFE_C, **(policy or {})),
+                  RelayPolicy(safe_setpoint_c=SAFE_C, command_limits=device.limits,
+                              **(policy or {})),
                   clock=clock or Clock()),
             fake, line)
 

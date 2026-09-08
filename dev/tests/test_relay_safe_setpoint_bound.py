@@ -87,6 +87,20 @@ def main() -> int:
         ok(f"{lo:g}" in text and f"{hi:g}" in text,
            "the error quotes the RESOLVED range, not the code ceiling")
 
+    # F8: the resolved bound cannot be dropped by normal dataclass operations.
+    import dataclasses as _dc
+    good = RelayPolicy.from_config(safe_setpoint_c=mid)
+    try:
+        _dc.replace(good, safe_setpoint_c=5.0, command_limits=None)
+        ok(False, "replace(command_limits=None) must raise, not fall back to (0,30)")
+    except Exception:
+        ok(True, "replace(safe_setpoint_c=5.0, command_limits=None) raises (no wide fallback)")
+    try:
+        RelayPolicy(safe_setpoint_c=20.0)
+        ok(False, "direct RelayPolicy without command_limits must raise")
+    except Exception:
+        ok(True, "direct RelayPolicy without command_limits raises (bound is required)")
+
     print()
     if FAILURES:
         print(f"[test] {len(FAILURES)} FAILURE(S)")
