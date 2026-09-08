@@ -80,10 +80,29 @@ from ..circulator import api as _circ
 from . import registers
 from . import safety as _safety
 from .reading import EnvironmentReading
-from .safety import CommsLost
+from .safety import ActuationNotAllowed, CommsLost, FailSafeIncomplete
 
 #: The one channel this module forwards. DF9, the PLC's temperature-PID output.
 SOURCE_CHANNEL = "temp_pid_output_c"
+
+#: Recorded by a phase script into ``run.note()`` (F7): every watchdog in this
+#: relay is COOPERATIVE. It fires only from inside :meth:`Relay.step`, which the
+#: phase script must keep calling. If the host loop stops -- the process is
+#: SIGKILLed, hangs, or loses power -- no ``step()`` runs, nothing fires, the PLC
+#: ladder keeps running, and the bath holds its last setpoint. Closing this needs
+#: a PLC-ladder heartbeat timeout (the CLICK's ``SD41`` ``_Port1_No_Comm_Time``,
+#: MODBUS ADDRESS UNKNOWN), which does not exist yet. No background thread is
+#: added here on purpose: a tool that runs a loop nobody started is a tool that
+#: decides, and it is invisible to the run record.
+COOPERATIVE_WATCHDOG_RESIDUAL = (
+    "COOPERATIVE WATCHDOG ONLY: every watchdog in this relay fires from inside "
+    "Relay.step(), which the phase script must keep calling. If the host loop "
+    "stops (SIGKILL, hang, power loss), no step() runs, nothing fires, the PLC "
+    "ladder keeps running, and the bath holds its last setpoint. Closing this "
+    "needs a PLC-ladder heartbeat timeout (the CLICK's SD41 _Port1_No_Comm_Time, "
+    "MODBUS ADDRESS UNKNOWN), which does not exist yet. No background thread is "
+    "added here on purpose: a tool that runs a loop nobody started is a tool "
+    "that decides, and it is invisible to the run record.")
 
 #: Section of ``configs/config.yaml`` that declares the comms-loss setpoint.
 #: It is the CIRCULATOR's section, because the setpoint is a bath command.
@@ -386,6 +405,9 @@ class Relay:
 
     SOURCE_CHANNEL = SOURCE_CHANNEL
 
+    #: Also on the class, so a phase script can reach it without the module.
+    COOPERATIVE_WATCHDOG_RESIDUAL = COOPERATIVE_WATCHDOG_RESIDUAL
+
     def __init__(self, env_client: Any, circulator: Any, policy: RelayPolicy,
                  *, clock: Any = None) -> None:
         if not isinstance(policy, RelayPolicy):
@@ -397,8 +419,14 @@ class Relay:
         self.circulator = circulator
         self.policy = policy
         self._clock = clock or time.monotonic
-        #: Set once the pre-declared fail-safe has been executed.
+        #: Set once the pre-declared fail-safe has been executed. LATCHED (F1):
+        #: once True, :meth:`step` keeps refusing to forward until :meth:`rearm`
+        #: is called explicitly. A recovered PLC with the PID off and a stale DF9
+        #: must never be silently forwarded again.
         self.safe_mode = False
+        #: Explicit rearm bookkeeping (F1).
+        self._rearm_count = 0
+        self._last_rearm: dict[str, Any] | None = None
         self.last_record: RelayRecord | None = None
         self._bad_since: float | None = None
         self._write_bad_since: float | None = None
@@ -441,6 +469,12 @@ class Relay:
         a state nobody observed.
         """
         now = self._read_clock()
+        # F1: safe mode is LATCHED. Once the fail-safe has run, every step refuses
+        # until rearm() is called -- a recovered PLC with C1 off and a stale DF9
+        # must never be silently forwarded again.
+        if self.safe_mode:
+            return self._refuse_latched(now)
+
         reading = self.env.read_block()
         value = reading.channels.get(SOURCE_CHANNEL)
         reason = self._why_unusable(reading, value)
@@ -449,6 +483,14 @@ class Relay:
             return self._refuse(now, reading, reason)
 
         self._bad_since = None
+
+        # F1: only forward when the PID loop is actually closed AND we know it is.
+        # pid_enabled False (loop open) or None (unread) both refuse: a disabled
+        # or unknown loop's output is not a live command to relay to the bath.
+        pid_reason = self._why_pid_blocks(reading)
+        if pid_reason is not None:
+            return self._refuse_pid(now, reading, pid_reason)
+
         previous = self._last_value
         step_c = None if previous is None else abs(float(value) - previous)
         quality = {
@@ -462,32 +504,116 @@ class Relay:
                             "PLC is running the loop and would not know.",
         }
 
+        # F4: ONE exception boundary around the whole bound+write sequence. On
+        # ANY failure -- an out-of-bound value, a link that was never opened, a
+        # boot-window refusal, a sink re-validation -- attempt the fail-safe,
+        # attach its record to the exception, and re-raise. An escape that skips
+        # safe() would leave the bath on its last command and C1 still enabled.
         try:
             # Raises, never clamps. Not swallowed: an out-of-bound PID output is
             # a safety event, and the prior system forwarded exactly this.
             sp = self.circulator.bound(float(value))
+            write = self.circulator.write_setpoint(sp)
+            write_dict = write.as_dict() if hasattr(write, "as_dict") else dict(write)
         except _circ.SafetyError as exc:
             record = self.safe(
-                reason="DF9=%r was refused by the circulator command bound: %s"
-                       % (value, exc))
+                reason="DF9=%r was refused by the circulator (%s)" % (value, exc))
+            exc.record = record
+            raise
+        except Exception as exc:                                      # noqa: BLE001
+            record = self.safe(
+                reason="the circulator write path raised %s: %s"
+                       % (type(exc).__name__, exc))
             exc.record = record
             raise
 
-        write = self.circulator.write_setpoint(sp)
-        write_dict = write.as_dict() if hasattr(write, "as_dict") else dict(write)
+        outcome = write_dict.get("outcome")
+        # F3: a dry-run PLAN is not a delivery. Only a CONFIRMED write is
+        # forwarded, establishes the flag baseline, and clears the write
+        # watchdog; a PLANNED write set neither and is not counted as forwarded.
+        # A dry run is explicitly non-actuating.
+        sent = bool(write_dict.get("sent"))
         record = RelayRecord(
             t_utc=reading.t_utc, monotonic_s=reading.monotonic_s,
-            forwarded=True, value_c=float(value), source_channel=SOURCE_CHANNEL,
+            forwarded=sent, value_c=float(value), source_channel=SOURCE_CHANNEL,
             reading=reading.as_dict(), write=write_dict,
-            safe_mode=self.safe_mode, quality=quality, reason=None)
+            safe_mode=self.safe_mode, quality=quality,
+            reason=None if sent else
+                   "the circulator write was PLANNED only (a dry run: "
+                   "circulator.allow_actuation is off); nothing was sent to the "
+                   "bath, so no value was delivered and none is held")
         self.last_record = record
 
-        if write_dict.get("outcome") == "failed":
-            self._on_write_failure(now, write_dict)
-        else:
+        if outcome == "confirmed":
             self._write_bad_since = None
-            # Only the flag's baseline; see _last_value's comment.
+            # Only the flag's baseline; see _last_value's comment. Set ONLY on a
+            # confirmed delivery (F3), never on a plan.
             self._last_value = float(value)
+        elif outcome == "failed":
+            self._on_write_failure(now, write_dict)
+        # "planned": non-actuating. No baseline, no watchdog reset, no failure
+        # timer touched -- a dry run neither confirms nor fails a delivery.
+        return record
+
+    def _refuse_latched(self, now: float) -> RelayRecord:
+        """Refuse a step because safe mode is LATCHED (F1). Forwards nothing."""
+        reason = ("SAFE MODE is LATCHED: the fail-safe has already run and step() "
+                  "keeps refusing to forward until rearm() is called explicitly. A "
+                  "recovered PLC with the PID off and a stale DF9 must not be "
+                  "silently forwarded again.")
+        quality = {
+            "large_step": False, "step_c": None,
+            "large_step_c": self.policy.large_step_c,
+            "previous_value_c": self._last_value,
+            "safe_mode_latched": True,
+            "rearm_count": self._rearm_count,
+        }
+        record = RelayRecord(
+            t_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            monotonic_s=now, forwarded=False, value_c=None,
+            source_channel=SOURCE_CHANNEL, reading={}, write=None,
+            safe_mode=True, quality=quality, reason=reason)
+        self.last_record = record
+        return record
+
+    @staticmethod
+    def _why_pid_blocks(reading: EnvironmentReading) -> str | None:
+        """Why DF9 may not be forwarded given the PID coil, or ``None`` if it may.
+
+        ``pid_enabled is True`` alone permits a forward. ``False`` (the loop is
+        open) and ``None`` (the coil could not be read) both refuse -- and they
+        are different facts, so the reason says which (F1).
+        """
+        pid = reading.pid_enabled
+        if pid is True:
+            return None
+        if pid is False:
+            return ("C1 (PID Auto) is OFF: the PLC loop is open, so DF9 is not a "
+                    "live command. Forwarding a disabled controller's output to "
+                    "the bath is refused, not sent.")
+        return ("C1 (PID Auto) could not be read (pid_enabled is None): the loop "
+                "state is unknown, and 'unknown' is not 'closed'. Refused rather "
+                "than forwarding on a state never observed.")
+
+    def _refuse_pid(self, now: float, reading: EnvironmentReading,
+                    reason: str) -> RelayRecord:
+        """Record a non-forward because the PID loop is off/unknown (F1).
+
+        The PLC read SUCCEEDED, so the PLC-staleness clock is not engaged here;
+        this is a report that the loop is not closed, and it does not latch.
+        """
+        quality = {
+            "large_step": False, "step_c": None,
+            "large_step_c": self.policy.large_step_c,
+            "previous_value_c": self._last_value,
+            "pid_enabled": reading.pid_enabled,
+        }
+        record = RelayRecord(
+            t_utc=reading.t_utc, monotonic_s=reading.monotonic_s,
+            forwarded=False, value_c=None, source_channel=SOURCE_CHANNEL,
+            reading=reading.as_dict(), write=None,
+            safe_mode=self.safe_mode, quality=quality, reason=reason)
+        self.last_record = record
         return record
 
     @staticmethod
@@ -548,35 +674,75 @@ class Relay:
         safe_record = self.safe(
             reason="no usable PLC reading for %.3f s (plc_stale_s=%g): %s"
                    % (elapsed, self.policy.plc_stale_s, reason))
-        error = CommsLost(
-            "no usable PLC reading for %.3f s, past environment.plc_stale_s=%g. "
-            "The safe setpoint %g C was written and the PID was disabled. The "
-            "last value was NOT held: a real log from 2026-01-11 ends with the "
+        # F5: the raised message must describe what the fail-safe ACTUALLY did,
+        # derived from the attached record -- not claim success unconditionally.
+        kind, safe_msg = self._fail_safe_outcome(safe_record)
+        error = kind(
+            "no usable PLC reading for %.3f s, past environment.plc_stale_s=%g. %s "
+            "The last value was NOT held: a real log from 2026-01-11 ends with the "
             "output pinned at exactly 30.000 while the measured temperature read "
             "11.4 C, so holding the last value can mean holding a saturated "
             "maximum. Last refusal: %s. Last transport error: %r"
-            % (elapsed, self.policy.plc_stale_s, self.policy.safe_setpoint_c,
-               reason, getattr(self.env, "last_error", None)))
+            % (elapsed, self.policy.plc_stale_s, safe_msg, reason,
+               getattr(self.env, "last_error", None)))
         error.record = safe_record
+        error.write = safe_record.write
+        error.pid = safe_record.quality.get("pid_disable")
         raise error
 
     def _on_write_failure(self, now: float, write: dict) -> None:
-        """Fire the circulator watchdog if writes have been failing too long."""
+        """Fire the circulator watchdog if writes have been failing too long.
+
+        F6: route through the common :meth:`safe` path so the declared safe
+        setpoint is at least ATTEMPTED, not merely the PID disabled. The MCU
+        applies writes whose echo is missing or malformed, so leaving it on its
+        last value while only turning C1 off is the hazard this closes.
+        """
         if self._write_bad_since is None:
             self._write_bad_since = now
         elapsed = now - self._write_bad_since
         if elapsed <= self.policy.circ_stale_s:
             return
-        pid = self._disable_pid()
-        self.safe_mode = True
-        error = CommsLost(
+        safe_record = self.safe(
+            reason="no verified circulator write for %.3f s (circ_stale_s=%g); "
+                   "last write error: %r"
+                   % (elapsed, self.policy.circ_stale_s, write.get("error")))
+        # F5: derive the outcome and message from what the fail-safe confirmed.
+        kind, safe_msg = self._fail_safe_outcome(safe_record)
+        error = kind(
             "no verified circulator write for %.3f s, past "
-            "circulator.circ_stale_s=%g. The PID was disabled (%s). %s"
-            % (elapsed, self.policy.circ_stale_s,
-               pid.get("outcome", "unknown"), self.HONEST_RESIDUAL))
-        error.record = self.last_record
-        error.pid = pid
+            "circulator.circ_stale_s=%g. %s"
+            % (elapsed, self.policy.circ_stale_s, safe_msg))
+        error.record = safe_record
+        error.write = safe_record.write
+        error.pid = safe_record.quality.get("pid_disable")
         raise error
+
+    def _fail_safe_outcome(self, record: RelayRecord) -> tuple[type, str]:
+        """The exception type and message for a fired watchdog, from what the
+        fail-safe actually CONFIRMED (F5).
+
+        Returns :class:`~.safety.FailSafeIncomplete` and conditional
+        ("ATTEMPTED") language unless BOTH the safe-setpoint write and the PID
+        disable came back ``outcome="confirmed"``; only then is it a plain
+        :class:`~.safety.CommsLost` stating the fail-safe completed.
+        """
+        q = record.quality
+        confirmed = bool(q.get("safe_confirmed"))
+        write_outcome = q.get("safe_write_outcome")
+        pid_outcome = q.get("pid_disable_outcome")
+        if confirmed:
+            return CommsLost, (
+                "The safe setpoint %g C was written and CONFIRMED, and the PID "
+                "was disabled and CONFIRMED."
+                % float(self.policy.safe_setpoint_c))
+        return FailSafeIncomplete, (
+            "FAIL-SAFE INCOMPLETE: the safe setpoint %g C write was ATTEMPTED "
+            "(outcome=%r) and the PID disable was ATTEMPTED (outcome=%r); at "
+            "least one was NOT confirmed, so the bath may not hold the safe "
+            "setpoint and the loop may not be open. %s"
+            % (float(self.policy.safe_setpoint_c), write_outcome, pid_outcome,
+               self.HONEST_RESIDUAL))
 
     # -- the pre-declared fail-safe ---------------------------------------
     def safe(self, *, reason: str = "explicit safe() call") -> RelayRecord:
@@ -597,6 +763,19 @@ class Relay:
         ``set_pid(False)`` is permitted with ``allow_actuation`` false: turning
         the loop off is the safe direction, so a supervisor that may not write
         must still be a supervisor that can stop.
+
+        **What this method reports, and what it does not.** It records what it
+        ATTEMPTED and whether each action was confirmed -- ``safe_confirmed`` in
+        the record's quality is True only when the safe-setpoint write and the
+        PID disable both came back ``outcome="confirmed"``. It never raises (an
+        abort path that can raise is not an abort path); the watchdog callers
+        turn an unconfirmed fail-safe into a
+        :class:`~.safety.FailSafeIncomplete`. **True dead-link safety is not
+        achieved here at all**: the circulator has no read-back, so a
+        ``confirmed`` bath write is the most software can ever assert, and a dead
+        serial link cannot be made safe from this host. Closing that needs an
+        independent PLC/MCU watchdog (a ladder heartbeat on the CLICK's SD41),
+        which does not exist yet -- see :data:`COOPERATIVE_WATCHDOG_RESIDUAL`.
         """
         t_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
         monotonic_s = time.monotonic()
@@ -614,6 +793,14 @@ class Relay:
         finally:
             pid = self._disable_pid()
 
+        # F5: derive the overall fail-safe status from what was CONFIRMED. A
+        # "planned" (gate off) or "failed" (dead link) write, or a failed C1
+        # disable, means the fail-safe was only ATTEMPTED -- the record says so
+        # rather than the caller asserting success.
+        write_outcome = (write_dict or {}).get("outcome")
+        pid_outcome = pid.get("outcome")
+        safe_confirmed = (write_outcome == "confirmed"
+                          and pid_outcome == "confirmed")
         quality = {
             "large_step": False,
             "step_c": None,
@@ -621,7 +808,16 @@ class Relay:
             "previous_value_c": self._last_value,
             "safe_setpoint_c": float(self.policy.safe_setpoint_c),
             "pid_disable": pid,
+            "pid_disable_outcome": pid_outcome,
+            "safe_write_outcome": write_outcome,
+            "safe_confirmed": safe_confirmed,
             "safe_write_error": write_error,
+            "safe_summary": (
+                "safe setpoint write outcome=%r, PID disable outcome=%r -> "
+                "%s. This reports what was ATTEMPTED; a confirmed bath write is "
+                "the most software can assert (the circulator has no read-back)."
+                % (write_outcome, pid_outcome,
+                   "CONFIRMED" if safe_confirmed else "NOT fully confirmed")),
             "residual_risk": self.HONEST_RESIDUAL,
         }
         record = RelayRecord(
@@ -630,9 +826,46 @@ class Relay:
             source_channel="policy.safe_setpoint_c",
             reading={}, write=write_dict, safe_mode=True,
             quality=quality,
-            reason="SAFE MODE: %s" % reason)
+            reason="SAFE MODE (%s): %s"
+                   % ("confirmed" if safe_confirmed
+                      else "INCOMPLETE, not fully confirmed", reason))
         self.last_record = record
         return record
+
+    def rearm(self) -> dict[str, Any]:
+        """Clear the LATCHED safe mode so :meth:`step` may forward again (F1).
+
+        Re-arming resumes forwarding the live PID output to the bath, which is an
+        actuation, so it is **refused unless the circulator's ``allow_actuation``
+        is set** (raises :class:`~.safety.ActuationNotAllowed`). It records that
+        it ran and returns that record for the phase script to log; it does NOT
+        re-enable the PID -- that is a separate, deliberate operator action.
+
+        The staleness timers are reset too, so a rearm starts a fresh window
+        rather than immediately re-tripping on stale history.
+        """
+        allowed = bool(getattr(getattr(self.circulator, "settings", None),
+                               "allow_actuation", False))
+        if not allowed:
+            raise ActuationNotAllowed(
+                "refusing to rearm the relay: circulator.allow_actuation is off. "
+                "Re-arming resumes forwarding the PID output to the bath, which "
+                "is an actuation and must be enabled deliberately.")
+        was = self.safe_mode
+        self.safe_mode = False
+        self._bad_since = None
+        self._write_bad_since = None
+        self._rearm_count += 1
+        event = {
+            "action": "rearm",
+            "was_safe_mode": was,
+            "rearm_count": self._rearm_count,
+            "t_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "note": "safe mode cleared by explicit rearm(); the PID was NOT "
+                    "re-enabled -- that is a separate, deliberate operator action.",
+        }
+        self._last_rearm = event
+        return event
 
     def _disable_pid(self) -> dict[str, Any]:
         """Drive C1 False and report what happened. Never raises.
@@ -681,6 +914,7 @@ class Relay:
 
 
 __all__ = [
+    "COOPERATIVE_WATCHDOG_RESIDUAL",
     "DEFAULT_CIRC_STALE_S",
     "DEFAULT_LARGE_STEP_C",
     "DEFAULT_PLC_STALE_S",

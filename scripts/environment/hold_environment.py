@@ -274,6 +274,11 @@ def run(args: argparse.Namespace) -> int:
     try:
         # -- the honest residual, and what this run does NOT cover ------------
         record_run.note(env.Relay.HONEST_RESIDUAL)
+        # F7: every watchdog here is COOPERATIVE -- it fires only from inside
+        # Relay.step(), which this loop must keep calling. If this process is
+        # SIGKILLed or loses power, nothing fires. Recorded verbatim so the run
+        # says what it cannot protect against.
+        record_run.note(env.COOPERATIVE_WATCHDOG_RESIDUAL)
         record_run.note(
             "NO PLC-SIDE WATCHDOG IS IN USE. The CLICK's own `SD41` diagnostic "
             "bit would let the ladder notice that this supervisor stopped "
@@ -404,11 +409,27 @@ def _hold(relay: env.Relay, record_run: runs.Run, args: argparse.Namespace,
             try:
                 record = relay.step()
             except env.CommsLost as exc:
-                # The relay has ALREADY written the safe setpoint and disabled
-                # the PID before raising. What happens next is a decision.
+                # The relay has ALREADY ATTEMPTED the safe setpoint and the PID
+                # disable before raising. What happens next is a decision.
+                #
+                # env.FailSafeIncomplete (a CommsLost subclass) means the
+                # fail-safe could NOT be confirmed -- a dead serial link or a
+                # gate off -- so the bath may not hold the safe setpoint. It is
+                # caught here too and flagged loudly; there is no software
+                # recovery for a dead link (see HONEST_RESIDUAL).
                 attached = getattr(exc, "record", None)
                 if attached is not None:
                     record_run.record(DEVICE, "relay", attached.as_dict())
+                if isinstance(exc, env.FailSafeIncomplete):
+                    record_run.note("FAIL-SAFE INCOMPLETE: the watchdog fired but "
+                                    "the safe setpoint and/or PID disable were not "
+                                    "confirmed (%s). The bath state is UNVERIFIED; "
+                                    "a person at the rig is required." % exc)
+                # Safe mode is now LATCHED (F1): this script does NOT rearm the
+                # relay. Re-arming resumes forwarding and is an actuation nobody
+                # asked for mid-abort; --stop-on-stale=continue keeps polling in
+                # latched safe mode, and only a deliberate operator rearm() plus
+                # a PID re-enable would resume control.
                 record_run.log("WATCHDOG: %s" % exc, device=DEVICE, level="error")
                 print("WATCHDOG: %s" % exc, file=sys.stderr)
                 refused += 1

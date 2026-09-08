@@ -111,11 +111,17 @@ from .registers import (
     provenance_table,
     regs_to_f32,
 )
-from .relay import Relay, RelayPolicy, RelayRecord
+from .relay import (
+    COOPERATIVE_WATCHDOG_RESIDUAL,
+    Relay,
+    RelayPolicy,
+    RelayRecord,
+)
 from .safety import (
     ActuationNotAllowed,
     BoundedSetpoint,
     CommsLost,
+    FailSafeIncomplete,
     PlcError,
     RateLimited,
     RateLimiter,
@@ -305,6 +311,7 @@ __all__ = [
     "C1_COIL",
     "CONFIG_SECTION",
     "CONFIRMED",
+    "COOPERATIVE_WATCHDOG_RESIDUAL",
     "DEFAULT_DEVICE_ID",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
@@ -325,6 +332,7 @@ __all__ = [
     "Environment",
     "EnvironmentNode",
     "EnvironmentReading",
+    "FailSafeIncomplete",
     "FakePlc",
     "PlcClient",
     "PlcError",

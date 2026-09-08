@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO))
 from tools import config as _config  # noqa: E402
 from tools.circulator.api import (  # noqa: E402
     Circulator,
+    CirculatorError,  # noqa: E402
     CirculatorSettings,
     FakeSerial,
     decode_setpoint,
@@ -45,8 +46,17 @@ from tools.circulator.api import (  # noqa: E402
 from tools.circulator.api import SafetyError as CircSafetyError  # noqa: E402
 from tools.environment import registers  # noqa: E402
 from tools.environment.plc import FakePlc, PlcClient, PlcSettings  # noqa: E402
-from tools.environment.relay import Relay, RelayPolicy  # noqa: E402
-from tools.environment.safety import CommsLost, SafetyError  # noqa: E402
+from tools.environment.relay import (  # noqa: E402
+    COOPERATIVE_WATCHDOG_RESIDUAL,
+    Relay,
+    RelayPolicy,
+)
+from tools.environment.safety import (  # noqa: E402
+    ActuationNotAllowed,
+    CommsLost,
+    FailSafeIncomplete,
+    SafetyError,
+)
 
 fails = 0
 
@@ -346,6 +356,137 @@ _seq = iter([1000.0, 990.0, 990.0])
 relay, _f9b, _l9b = build(clock=lambda: next(_seq))
 relay.step()  # t=1000, good read, forwards normally
 raises(SafetyError, relay.step, "a backward clock jump is refused")
+
+def unopened_relay(*, circ_actuation: bool, pid_on: bool = True,
+                   serial: dict | None = None, policy: dict | None = None):
+    """A relay whose circulator is NOT opened, for the exception/gate paths."""
+    fk = FakePlc(dict(GOOD_ROW), coils={registers.C1_COIL: bool(pid_on)})
+    cl = PlcClient(PlcSettings(allow_actuation=True), fk)
+    ln = FakeSerial(**(serial or {}))
+    dv = Circulator(
+        CirculatorSettings(port="/tmp/sdl-fake-circulator",
+                           allow_actuation=circ_actuation, boot_settle_s=0.0), ln)
+    rl = Relay(cl, dv, RelayPolicy(safe_setpoint_c=SAFE_C, command_limits=dv.limits,
+                                   **(policy or {})))
+    return rl, fk, ln, dv
+
+
+print("\n--- F1: with the PID loop OFF, DF9 is not forwarded ---")
+relay, fake, line = build(pid_on=False)
+rec = relay.step()
+ok(rec.forwarded is False, "C1 off -> DF9 is NOT forwarded (a disabled loop's output is not a command)")
+ok(rec.reason is not None and "OFF" in rec.reason.upper() and "C1" in rec.reason,
+   "the reason names the PID coil being off", str(rec.reason)[:70])
+ok(line.frames == [], "and nothing reached the bath")
+ok(relay.safe_mode is False, "this is a plain refusal, not safe mode")
+
+print("\n--- F1: with the PID coil UNREADABLE (None), DF9 is not forwarded ---")
+relay, fake, line = build(plc={"error_on": {"read_coils"}})
+rec = relay.step()
+ok(rec.reading["pid_enabled"] is None, "C1 could not be read -> pid_enabled is None")
+ok(rec.forwarded is False, "an unknown loop state is NOT forwarded ('unknown' is not 'closed')")
+ok(line.frames == [], "and nothing reached the bath")
+
+print("\n--- F1: safe mode is LATCHED; step() keeps refusing until rearm() ---")
+relay, fake, line = build()
+relay.safe(reason="latch it for the test")
+ok(relay.safe_mode is True, "safe() latched safe mode")
+frames_before = len(line.frames)
+poke(fake, 9, 24.0)                       # a perfectly good, in-bound reading
+rec = relay.step()
+ok(rec.forwarded is False and "LATCH" in (rec.reason or "").upper(),
+   "a subsequent step REFUSES while latched -- even with a good reading", str(rec.reason)[:60])
+ok(len(line.frames) == frames_before, "and forwards nothing new: a recovered PLC does not silently resume")
+event = relay.rearm()
+ok(relay.safe_mode is False, "rearm() clears the latch")
+ok(event["action"] == "rearm" and event["rearm_count"] == 1 and event["was_safe_mode"] is True,
+   "and records that it ran", str(event)[:70])
+# rearm() deliberately does NOT re-enable the PID (safe() disabled C1); a real
+# resume also needs the operator to re-enable the loop, so simulate that here.
+rec = relay.step()
+ok(rec.forwarded is False and rec.reading["pid_enabled"] is False,
+   "even after rearm, a step with C1 still OFF does not forward -- rearm re-enables no PID")
+fake.coils[registers.C1_COIL] = True      # operator re-enables the loop deliberately
+rec = relay.step()
+ok(rec.forwarded is True, "with the latch cleared AND the PID re-enabled, forwarding resumes")
+
+print("\n--- F1: rearm() requires circulator actuation to be allowed ---")
+relay, fake, line, dev = unopened_relay(circ_actuation=False)
+relay.safe(reason="latch it")
+ok(relay.safe_mode is True, "the relay is latched safe")
+raises(ActuationNotAllowed, relay.rearm,
+       "rearm() is refused while circulator.allow_actuation is off")
+ok(relay.safe_mode is True, "and safe mode stays latched after the refusal")
+
+print("\n--- F3: a dry-run PLANNED write is not a healthy delivery ---")
+relay, fake, line, dev = unopened_relay(circ_actuation=False)   # every write is planned
+rec = relay.step()
+ok(rec.write is not None and rec.write["outcome"] == "planned", "the write is a PLAN")
+ok(rec.forwarded is False, "and forwarded is False -- a plan delivered nothing")
+ok(line.frames == [], "nothing was sent")
+poke(fake, 9, 5.0)                        # a big jump from GOOD_ROW's DF9
+rec2 = relay.step()
+ok(rec2.quality["previous_value_c"] is None,
+   "a plan establishes NO baseline -- previous_value_c is still None")
+ok(rec2.quality["large_step"] is False,
+   "so a jump after only plans is not flagged against a phantom baseline")
+
+print("\n--- F4: a write-path exception still runs the fail-safe ---")
+# allow_actuation on, but the link is never opened -> write_registers raises
+# OUTSIDE the old bound()-only try. The whole sequence must be guarded.
+relay, fake, line, dev = unopened_relay(circ_actuation=True)
+exc = raises(CirculatorError, relay.step, "a write on an unopened link raises")
+ok(exc is not None and getattr(exc, "record", None) is not None,
+   "and it carries the fail-safe record -- safe() ran (F4)")
+ok(relay.safe_mode is True, "the relay went to safe mode on the exception")
+ok(fake.coils.get(registers.C1_COIL) is False, "and C1 was driven off by the fail-safe")
+
+print("\n--- F5: an unconfirmed fail-safe raises FailSafeIncomplete, not a false success ---")
+clock = Clock()
+relay, fake, line = build(clock=clock, policy={"plc_stale_s": 5.0},
+                          plc={"error_on": {"read_holding_registers"}},
+                          serial={"error_response": True})   # the SAFE write will fail
+relay.step()
+clock.advance(5.001)
+exc = raises(FailSafeIncomplete, relay.step,
+             "beyond plc_stale_s with a dead bath link -> FailSafeIncomplete")
+ok(isinstance(exc, CommsLost), "which is a CommsLost subclass, so existing handlers still catch it")
+ok(exc is not None and "INCOMPLETE" in str(exc) and "ATTEMPTED" in str(exc),
+   "and the message says ATTEMPTED, never 'was written'", str(exc)[:80])
+ok(exc is not None and getattr(exc, "record", None) is not None
+   and exc.record.quality["safe_confirmed"] is False,
+   "the attached record shows safe_confirmed=False")
+ok(fake.coils.get(registers.C1_COIL) is False,
+   "C1 was still driven off (the PID-disable path is separate from the bath write)")
+
+print("\n--- F6: the circulator write watchdog ATTEMPTS the safe setpoint ---")
+clock = Clock()
+relay, fake, line = build(clock=clock, policy={"circ_stale_s": 4.0},
+                          serial={"error_response": True})
+relay.step()                               # DF9 write fails, frame recorded
+n_first = len(line.frames)
+clock.advance(4.5)
+exc = raises(CommsLost, relay.step, "beyond circ_stale_s the watchdog fires")
+ok(fake.coils.get(registers.C1_COIL) is False, "C1 was disabled")
+ok(last_frame_c(line) == SAFE_C,
+   "and the SAFE setpoint was ATTEMPTED -- the last frame on the wire is it, not the last DF9",
+   "%r" % last_frame_c(line))
+# The watchdog step forwards DF9 first (a frame), THEN the watchdog attempts the
+# safe setpoint (a second frame): two frames in the one step, the last SAFE_C.
+ok(len(line.frames) == n_first + 2,
+   "the watchdog step attempted the DF9 forward AND then the safe setpoint",
+   "%d then %d" % (n_first, len(line.frames)))
+
+print("\n--- F7: the cooperative-watchdog residual is a recordable constant ---")
+ok(isinstance(COOPERATIVE_WATCHDOG_RESIDUAL, str)
+   and "SD41" in COOPERATIVE_WATCHDOG_RESIDUAL
+   and "cooperative" in COOPERATIVE_WATCHDOG_RESIDUAL.lower(),
+   "COOPERATIVE_WATCHDOG_RESIDUAL names SD41 and the cooperative limit")
+ok(Relay.COOPERATIVE_WATCHDOG_RESIDUAL == COOPERATIVE_WATCHDOG_RESIDUAL,
+   "and is reachable on the Relay class for a phase script")
+_readme = (REPO / "tools" / "environment" / "README.md").read_text(encoding="utf-8")
+ok("What this layer cannot protect against" in _readme and "SD41" in _readme,
+   "and the README documents what the layer cannot protect against")
 
 print("\n%s" % ("ALL PASS" if fails == 0 else "%d FAILURE(S)" % fails))
 sys.exit(1 if fails else 0)

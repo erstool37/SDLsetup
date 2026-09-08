@@ -205,6 +205,27 @@ person at the rig or a PLC-side ladder change. Nothing in software closes this
 gap — it is available as `Relay.HONEST_RESIDUAL`, to be passed to `run.note()`,
 because silence there would read as "handled".
 
+### What this layer cannot protect against
+
+**Every watchdog in the relay is cooperative, and cannot act if the host loop
+stops.** `Relay.step()` is where PLC staleness, circulator write staleness, and
+out-of-bound refusals are all detected — so they fire only while a phase script
+keeps calling `step()`. If that process hangs, is `SIGKILL`ed, or loses power,
+no `step()` runs, nothing fires, the PLC ladder keeps running its own loop, and
+the bath holds whatever setpoint it last received.
+
+Closing this gap needs a **PLC-ladder heartbeat timeout** — the CLICK's own
+`SD41` (`_Port1_No_Comm_Time`) would let the ladder notice that this supervisor
+stopped talking and drive itself safe. **Its Modbus address is unknown and was
+not guessed** (an invented address reads some other register and reports it as a
+link flag), so that heartbeat **does not exist yet**. `TODO(operator): establish
+the SD41 address via the CLICK Address Picker, or add a ladder-side heartbeat.`
+
+No background watchdog thread is added in Python on purpose: a tool that runs a
+loop nobody started is a tool that decides, and it is invisible to the run
+record. The residual is exposed as `Relay.COOPERATIVE_WATCHDOG_RESIDUAL` and
+`hold_environment.py` records it into every run via `run.note()`.
+
 ## Diagnostics we cannot read
 
 The CLICK's own comms flags exist and their nicknames are known. **Their Modbus

@@ -96,6 +96,27 @@ class CommsLost(PlcError):
     """
 
 
+class FailSafeIncomplete(CommsLost):
+    """The fail-safe ran but could NOT be confirmed (F5).
+
+    Raised by the relay's watchdogs when the safe-setpoint write and/or the PID
+    disable did not both come back ``outcome="confirmed"`` -- a circulator gate
+    off (``planned``), a dead serial link (``failed``), or a dead PLC (failed C1
+    write). It is a subclass of :class:`CommsLost`, so existing ``except
+    CommsLost`` handlers still catch it, but its distinct type lets a caller tell
+    "the fail-safe completed" from "the fail-safe was only ATTEMPTED".
+
+    It carries the two results it could not confirm: ``record`` (the safe-mode
+    :class:`~tools.environment.relay.RelayRecord`), ``write`` (the safe-setpoint
+    write dict), and ``pid`` (the PID-disable dict).
+
+    **True dead-link safety is not achieved by this exception.** The circulator
+    has no read-back, so even a raised message can only report what was
+    attempted; closing the gap needs an independent PLC/MCU watchdog (a ladder
+    heartbeat timeout on the CLICK's ``SD41``), which does not exist yet.
+    """
+
+
 class SafetyError(PlcError):
     """A commanded value violates a guard. Always raised, never clamped."""
 
@@ -364,6 +385,7 @@ __all__ = [
     "ActuationNotAllowed",
     "BoundedSetpoint",
     "CommsLost",
+    "FailSafeIncomplete",
     "PlcError",
     "RateLimited",
     "RateLimiter",
