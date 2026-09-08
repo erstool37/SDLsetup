@@ -120,9 +120,13 @@ raises(_config.ConfigError,
 
 print("\n--- the empty-key trap: a blank value parses to {}, not None ---")
 blank = _config.load_yaml(CONFIG_PATH).get("circulator", {})
-ok(blank.get("port") == {},
-   "circulator.port is blank on purpose and parses to an EMPTY MAPPING",
-   repr(blank.get("port")))
+# port was blank in the shipped config; the operator set it to the WSL by-id path
+# on 2026-09-08 (usbipd attach). The blank-key trap is shown on the synthetic file
+# below; here we assert the LIVE port is a real, non-empty string.
+_live_port = blank.get("port")
+ok(isinstance(_live_port, str) and _live_port.strip() != "",
+   "the LIVE circulator.port is a real path (operator set it), not a blank",
+   repr(_live_port))
 # The trap itself is demonstrated on a SYNTHETIC blank key, not on the live
 # config: safe_setpoint_c is an operator decision (set 2026-09-08), and a test
 # that required it to stay blank would fail the moment someone made it.
@@ -136,6 +140,9 @@ finally:
 ok(_synthetic.get("safe_setpoint_c") == {},
    "a BLANK safe_setpoint_c parses to an EMPTY MAPPING -- and {} is FALSY, so "
    "`if value:` reads it as absent", repr(_synthetic.get("safe_setpoint_c")))
+ok(_synthetic.get("port") == {},
+   "a BLANK port likewise parses to an EMPTY MAPPING",
+   repr(_synthetic.get("port")))
 _live = blank.get("safe_setpoint_c")
 ok(isinstance(_live, float) and math.isfinite(_live),
    "the LIVE safe_setpoint_c is a finite number (operator set it), not a blank",

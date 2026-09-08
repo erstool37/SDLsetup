@@ -232,7 +232,7 @@ circulator:
   # WSL device path. Empty on purpose -- it depends on which busid was attached
   # this session and inventing one would open the wrong device.
   # TODO(operator): set after `usbipd attach --wsl --busid 2-1` (e.g. /dev/ttyUSB0).
-  port:
+  port: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B00183SQ-if00-port0   # set 2026-09-08: usbipd attach exposed the FT232R here (stable by-id path)
 
   # Serial framing, as the board is wired. "N" is QUOTED deliberately: this
   # file's parser reads YAML 1.1 booleans, so a bare N would become False.

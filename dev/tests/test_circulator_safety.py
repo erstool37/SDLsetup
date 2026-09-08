@@ -163,14 +163,22 @@ print("\n--- a bare `key:` means null, and must never become the string {} ---")
 blank = CirculatorSettings.from_config({"circulator": {"port": {}, "baudrate": 9600}})
 ok(blank.port is None, "a blank port resolves to None, not %r" % (blank.port,))
 ok(blank.sources.get("port") == "default", "and is reported as coming from the default")
-ok(CirculatorSettings.from_config().port is None,
-   "the live configs/config.yaml resolves port to None as its comment intends")
+# port was blank in the shipped config; the operator set it (usbipd attach,
+# 2026-09-08). The synthetic-blank case above still proves {} -> None; here the
+# live config resolves to the real path.
+_live_port = CirculatorSettings.from_config().port
+ok(isinstance(_live_port, str) and _live_port.strip() != "",
+   "the live configs/config.yaml resolves port to the operator-set path, not None",
+   repr(_live_port))
 blocked(lambda: CirculatorSettings.from_config({"circulator": {"port": {"nested": 1}}}),
         "a real nested block where a scalar belongs raises", _config.ConfigError)
 blocked(lambda: CirculatorSettings(port="   "),
         "an all-whitespace port is refused rather than opened", CirculatorError)
-ok(CirculatorSettings.from_config().sources.get("port") == "default",
-   "and safe_setpoint_c, also blank in that section, is simply not ours to read")
+# port is now operator-set (usbipd, 2026-09-08), so it resolves from the config
+# layer, not the code default.
+ok(CirculatorSettings.from_config().sources.get("port") != "default",
+   "the operator-set port resolves from the config layer, not the code default",
+   repr(CirculatorSettings.from_config().sources.get("port")))
 
 print("\n--- an UNQUOTED parity: N parses to False, and must be refused ---")
 # tools.config._parse_scalar accepts the YAML 1.1 false-words {false,no,off,n},
