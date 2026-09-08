@@ -254,6 +254,16 @@ class PlcSettings:
         if self.retries < 0:
             raise _config.ConfigError(
                 "environment.retries must not be negative, got %r" % (self.retries,))
+        # G3: config parsing yields real bools, but plain construction does not.
+        # A truthy non-bool (e.g. the string "false") would open the actuation
+        # gate, so require a real bool here too.
+        for _flag_name in ("allow_actuation", "dashboard_poll_plc"):
+            _flag = getattr(self, _flag_name)
+            if not isinstance(_flag, bool):
+                raise _config.ConfigError(
+                    "environment.%s must be a real bool, got %r; never "
+                    "truthiness -- every non-empty string is truthy, so a typo "
+                    "would switch a gate ON" % (_flag_name, _flag))
         if self.plc_stale_s <= 0.0 or self.relay_period_s <= 0.0:
             raise _config.ConfigError(
                 "environment.relay_period_s and plc_stale_s must be positive, got "
@@ -608,7 +618,16 @@ class PlcClient:
             self.last_error = "read_holding_registers(%d, count=%d): response " \
                 "carried no registers: %r" % (address, count, result)
             return None
-        return [int(word) for word in words]
+        # G7: the int() conversion is INSIDE the read guard. A malformed payload
+        # (a non-integer register word) is a failed read (read_ok False), not an
+        # exception that escapes read_block past every caller's guard.
+        try:
+            return [int(word) for word in words]
+        except (TypeError, ValueError) as exc:
+            self.last_error = ("read_holding_registers(%d, count=%d): non-integer "
+                               "register in payload %r: %s"
+                               % (address, count, words, exc))
+            return None
 
     def read_pid_enabled(self) -> bool | None:
         """Coil C1, the PID auto/manual flag. ``None`` when it could not be read.

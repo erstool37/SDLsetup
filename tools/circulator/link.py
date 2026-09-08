@@ -58,6 +58,7 @@ from .codec import (
     REGISTER_MAX,
     SETPOINT_ADDRESS,
     SETPOINT_COUNT,
+    decode_setpoint,
     encode_setpoint,
 )
 from .safety import ActuationNotAllowed, CirculatorError, SafetyError
@@ -422,6 +423,13 @@ class SerialLink:
     def write_registers(self, frame: _SetpointFrame) -> WriteResult:
         """Write the setpoint frame and CHECK WHAT CAME BACK.
 
+        G6: the decoded temperature is re-validated against this device's
+        resolved :class:`~.safety.CommandLimits` in :meth:`_check_frame` before
+        anything is sent, so a frame built through the public
+        :meth:`encode_frame` surface carrying an out-of-bound value (a bare
+        float, or a value inside the code ceiling but outside a tightened run
+        bound) is refused at the wire, not merely a bare float.
+
         Accepts **only** a :class:`_SetpointFrame` built by :meth:`encode_frame`;
         a raw ``(address, values)`` pair, a 1-register partial write, or a
         PLC-codec word pair can no longer reach the wire (F2c). The frame object
@@ -535,6 +543,17 @@ class SerialLink:
                 raise CirculatorError(
                     f"register {index}: {raw!r} outside 0..0x{REGISTER_MAX:04X}")
             frame.append(raw)
+        # G6: the shape checks above accept ANY in-range 16-bit words, so a frame
+        # built outside Circulator.write_setpoint -- via the public
+        # link.encode_frame()/write_registers() surface -- could still carry a
+        # temperature past THIS device's RESOLVED command bound (e.g. a bare
+        # float 35.0, or a value in the (0,10] gap under a config-tightened
+        # (10,30) run bound). Decode the frame back and re-validate against the
+        # sink's own CommandLimits, which RAISES (never clamps). So no public
+        # path can put an out-of-bound setpoint on the wire -- not merely no
+        # bare float. Only object.__setattr__/private-name forgery of a
+        # _SetpointFrame can still bypass this, which is the documented residual.
+        self.settings.limits.validate(decode_setpoint(frame))
         return frame
 
     def _unit_kwarg(self) -> str:

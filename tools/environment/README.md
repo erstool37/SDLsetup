@@ -226,6 +226,13 @@ loop nobody started is a tool that decides, and it is invisible to the run
 record. The residual is exposed as `Relay.COOPERATIVE_WATCHDOG_RESIDUAL` and
 `hold_environment.py` records it into every run via `run.note()`.
 
+`Relay.safe()` catches every `Exception` in the abort path and records a
+not-confirmed outcome rather than propagating (H6), but it **deliberately does
+not catch `BaseException`**: a real `KeyboardInterrupt` or `SystemExit` during
+an abort must propagate. That, and a caller forging setpoint state via
+`object.__setattr__` or private-name access, are unpreventable in Python and
+are documented rather than chased.
+
 ### What the setpoint guards do NOT stop (F2a residual)
 
 `BoundedSetpoint` (and the circulator's) is immutable and can only be built by a

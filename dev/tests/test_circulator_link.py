@@ -138,7 +138,7 @@ link = SerialLink(live(boot_settle_s=30.0), transport=fake)
 link.open(settle=False)
 ok(link.settle_remaining_s > 0, "the settle window is still open",
    "%.1f s left" % link.settle_remaining_s)
-blocked(lambda: link.write_registers(SerialLink.encode_frame(0.0)),
+blocked(lambda: link.write_registers(SerialLink.encode_frame(20.0)),
         "a frame during the boot window raises", SafetyError)
 ok(fake.frames == [], "and no frame was sent")
 link.close()
@@ -146,7 +146,7 @@ link.close()
 print("\n--- writing without opening is refused rather than opening implicitly ---")
 fake = FakeSerial()
 link = SerialLink(live(), transport=fake)
-blocked(lambda: link.write_registers(SerialLink.encode_frame(0.0)),
+blocked(lambda: link.write_registers(SerialLink.encode_frame(20.0)),
         "write_registers on a closed link raises")
 ok(fake.open_count == 0, "and does NOT reset the MCU to satisfy the caller")
 

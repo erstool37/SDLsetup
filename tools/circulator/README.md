@@ -127,11 +127,24 @@ whether it has an over-temperature cutoff or a setpoint clamp of its own is
 
 `config.yaml` may **tighten** the range for a run. It may never widen it.
 
+**The bound is enforced at the wire, not only at `bound()` (G6, 2026-09-08).**
+`SerialLink._check_frame` re-decodes every frame and re-validates the
+temperature against the sink's resolved `CommandLimits` before anything is
+sent. So the public `link.encode_frame()`/`write_registers()` surface cannot
+put an out-of-bound value on the wire — neither a bare float `35.0`, nor a
+value inside the code ceiling `(0,30)` but outside a tightened run bound
+`(10,30)` (e.g. `5.0`). Only forging a `_SetpointFrame` through the private
+`_FRAME_TOKEN`, `object.__setattr__`, or a private name bypasses it — the
+documented Python residual, not an ordinary-code path.
+
 **One deliberate asymmetry, so it does not read later as an inconsistency:** a
 configured *range* of exactly `[0.0, 30.0]` is legal because it merely equals
 the code ceiling, while the *values* `0.0` and `30.0` are still not commandable
-within it — the range check tolerates `EPS` so representation error cannot
-reject the ceiling itself, and the value check is strict with no `EPS` at all.
+within it. The code ceilings are exact float literals, so the range check
+compares against them **exactly** — it no longer adds `EPS` (G1, 2026-09-08):
+`+EPS` on the ceiling let `CommandLimits(max_c=30.0000005)` construct and then
+let a real 2.5e-7 overshoot pass `validate()`. The value check remains strict
+with no `EPS` at all.
 The same asymmetry now applies one step in: `[10.0, 30.0]` is a legal *range*
 because it tightens the ceiling, and `10.0` itself is still not a commandable
 *value*.

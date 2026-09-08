@@ -423,7 +423,7 @@ class Relay:
         #: once True, :meth:`step` keeps refusing to forward until :meth:`rearm`
         #: is called explicitly. A recovered PLC with the PID off and a stale DF9
         #: must never be silently forwarded again.
-        self.safe_mode = False
+        self._safe_mode = False
         #: Explicit rearm bookkeeping (F1).
         self._rearm_count = 0
         self._last_rearm: dict[str, Any] | None = None
@@ -445,6 +445,18 @@ class Relay:
         #: last_record (which _refuse_latched overwrites) so rearm() can require
         #: a CONFIRMED safe state before it resumes forwarding.
         self._last_safe: RelayRecord | None = None
+
+    @property
+    def safe_mode(self) -> bool:
+        """Whether the pre-declared fail-safe has latched. READ-ONLY (G2).
+
+        It is a property with no setter, so ``relay.safe_mode = False`` raises
+        ``AttributeError`` -- ordinary assignment must not be able to clear the
+        latch behind :meth:`rearm`'s confirmed-fail-safe check. The latch is
+        set on the backing field ``_safe_mode`` only inside :meth:`safe` and
+        cleared only inside :meth:`rearm`.
+        """
+        return self._safe_mode
 
     def _read_clock(self) -> float:
         """The injected clock, validated finite and monotonic.
@@ -475,7 +487,26 @@ class Relay:
         the command bound -- after executing the fail-safe. Both are events a
         phase script must see; swallowing either would leave the loop running on
         a state nobody observed.
+
+        G7: the clock read, the PLC read, and the usability evaluation all run
+        inside :meth:`_step_inner`, and this wrapper drives the fail-safe on ANY
+        exception from them (a NaN/backward injected clock, a ``read_block`` that
+        raised, a malformed value) -- so the relay is self-safe rather than
+        relying on the phase script's ``finally: relay.safe()``. Exceptions from
+        the bound/write sequence already ran :meth:`safe` and carry a fail-safe
+        record; those are re-raised untouched, never made safe a second time.
         """
+        try:
+            return self._step_inner()
+        except Exception as exc:                                      # noqa: BLE001
+            if getattr(exc, "record", None) is None:
+                exc.record = self.safe(
+                    reason="step() raised before/around the write guard: %s: %s"
+                           % (type(exc).__name__, exc))
+            raise
+
+    def _step_inner(self) -> RelayRecord:
+        """One iteration. Wrapped by :meth:`step`, which is the fail-safe boundary."""
         now = self._read_clock()
         # F1: safe mode is LATCHED. Once the fail-safe has run, every step refuses
         # until rearm() is called -- a recovered PLC with C1 off and a stale DF9
@@ -630,8 +661,22 @@ class Relay:
                               else dict(result))
             except Exception as exc:                                  # noqa: BLE001
                 write_error = "%s: %s" % (type(exc).__name__, exc)
-            if (write_dict or {}).get("outcome") == "confirmed":
+            outcome = (write_dict or {}).get("outcome")
+            if outcome == "confirmed":
                 self._pid_off_safe_done = True
+                self._write_bad_since = None
+            elif outcome == "failed" or write_error is not None:
+                # G5: a PID-off safe write that is not confirmed must escalate
+                # exactly like a forward-path write failure. Without this it
+                # retried every step forever and never promoted to circ_stale_s,
+                # so a dead bath link left the (possibly saturated) MCU value in
+                # place indefinitely. _on_write_failure raises past circ_stale_s
+                # and returns silently before it. A dry-run "planned" is
+                # non-actuating and deliberately NOT routed here.
+                failed = dict(write_dict or {})
+                if write_error is not None and failed.get("error") is None:
+                    failed["error"] = write_error
+                self._on_write_failure(now, failed)
         quality = {
             "large_step": False, "step_c": None,
             "large_step_c": self.policy.large_step_c,
@@ -791,11 +836,17 @@ class Relay:
 
         This is the abort path, and **an abort path that can itself raise is not
         an abort path** -- it runs from ``__exit__``/``finally`` while another
-        exception may still be propagating, so H6 wraps the WHOLE body: any
-        failure in the write, the PID disable, result normalisation, or record
-        building is turned into a recorded, NOT-confirmed outcome here rather
-        than propagated. ``safe()`` returns a :class:`RelayRecord` under any
-        input.
+        exception may still be propagating. H6 wraps the WHOLE body: the latch is
+        set first and unconditionally, and any ``Exception`` in the timestamp
+        calls, the write, the PID disable, result normalisation, or record
+        building is turned into a recorded, NOT-confirmed outcome rather than
+        propagated. ``safe()`` returns a :class:`RelayRecord` under any input.
+
+        ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``) is
+        **deliberately NOT caught**: a real Ctrl-C or interpreter shutdown during
+        an abort must propagate, and swallowing it would be the wrong kind of
+        'never raises'. That, and a caller forging state via ``object.__setattr__``
+        or private names, are the documented residuals -- unpreventable in Python.
 
         The PID write is in a ``finally``, so C1 is driven False even if the
         setpoint write fails -- the one real interlock the prior system had.
@@ -809,80 +860,104 @@ class Relay:
         **True dead-link safety is not achieved here**: the circulator has no
         read-back, so a ``confirmed`` bath write is the most software can assert.
         """
-        self.safe_mode = True
-        t_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        monotonic_s = time.monotonic()
+        # H6: latch FIRST and unconditionally. A plain attribute set cannot
+        # itself raise, and the latch must hold even if everything below fails --
+        # a fail-safe whose recording blew up is still a fail-safe that ran.
+        self._safe_mode = True
+        record: RelayRecord | None = None
         try:
-            write_dict: dict[str, Any] | None = None
-            write_error: str | None = None
+            t_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            monotonic_s = time.monotonic()
             try:
-                sp = self.circulator.bound(float(self.policy.safe_setpoint_c))
-                result = self.circulator.write_setpoint(sp)
-                write_dict = (result.as_dict() if hasattr(result, "as_dict")
-                              else dict(result))
-            except Exception as exc:                                  # noqa: BLE001
-                write_error = "%s: %s" % (type(exc).__name__, exc)
-            finally:
-                pid = self._disable_pid()
+                write_dict: dict[str, Any] | None = None
+                write_error: str | None = None
+                try:
+                    sp = self.circulator.bound(float(self.policy.safe_setpoint_c))
+                    result = self.circulator.write_setpoint(sp)
+                    write_dict = (result.as_dict() if hasattr(result, "as_dict")
+                                  else dict(result))
+                except Exception as exc:                              # noqa: BLE001
+                    write_error = "%s: %s" % (type(exc).__name__, exc)
+                finally:
+                    pid = self._disable_pid()
 
-            # F5: derive the overall fail-safe status from what was CONFIRMED.
-            write_outcome = (write_dict or {}).get("outcome")
-            pid_outcome = pid.get("outcome")
-            safe_confirmed = (write_outcome == "confirmed"
-                              and pid_outcome == "confirmed")
-            quality = {
-                "large_step": False,
-                "step_c": None,
-                "large_step_c": self.policy.large_step_c,
-                "previous_value_c": self._last_value,
-                "safe_setpoint_c": float(self.policy.safe_setpoint_c),
-                "pid_disable": pid,
-                "pid_disable_outcome": pid_outcome,
-                "safe_write_outcome": write_outcome,
-                "safe_confirmed": safe_confirmed,
-                "safe_write_error": write_error,
-                "safe_summary": (
-                    "safe setpoint write outcome=%r, PID disable outcome=%r -> "
-                    "%s. This reports what was ATTEMPTED; a confirmed bath write "
-                    "is the most software can assert (the circulator has no "
-                    "read-back)."
-                    % (write_outcome, pid_outcome,
-                       "CONFIRMED" if safe_confirmed else "NOT fully confirmed")),
-                "residual_risk": self.HONEST_RESIDUAL,
-            }
-            record = RelayRecord(
-                t_utc=t_utc, monotonic_s=monotonic_s,
-                forwarded=False, value_c=float(self.policy.safe_setpoint_c),
-                source_channel="policy.safe_setpoint_c",
-                reading={}, write=write_dict, safe_mode=True,
-                quality=quality,
-                reason="SAFE MODE (%s): %s"
-                       % ("confirmed" if safe_confirmed
-                          else "INCOMPLETE, not fully confirmed", reason))
+                # F5: derive the overall fail-safe status from what was CONFIRMED.
+                write_outcome = (write_dict or {}).get("outcome")
+                pid_outcome = pid.get("outcome")
+                safe_confirmed = (write_outcome == "confirmed"
+                                  and pid_outcome == "confirmed")
+                quality = {
+                    "large_step": False,
+                    "step_c": None,
+                    "large_step_c": self.policy.large_step_c,
+                    "previous_value_c": self._last_value,
+                    "safe_setpoint_c": float(self.policy.safe_setpoint_c),
+                    "pid_disable": pid,
+                    "pid_disable_outcome": pid_outcome,
+                    "safe_write_outcome": write_outcome,
+                    "safe_confirmed": safe_confirmed,
+                    "safe_write_error": write_error,
+                    "safe_summary": (
+                        "safe setpoint write outcome=%r, PID disable outcome=%r -> "
+                        "%s. This reports what was ATTEMPTED; a confirmed bath write "
+                        "is the most software can assert (the circulator has no "
+                        "read-back)."
+                        % (write_outcome, pid_outcome,
+                           "CONFIRMED" if safe_confirmed else "NOT fully confirmed")),
+                    "residual_risk": self.HONEST_RESIDUAL,
+                }
+                record = RelayRecord(
+                    t_utc=t_utc, monotonic_s=monotonic_s,
+                    forwarded=False, value_c=float(self.policy.safe_setpoint_c),
+                    source_channel="policy.safe_setpoint_c",
+                    reading={}, write=write_dict, safe_mode=True,
+                    quality=quality,
+                    reason="SAFE MODE (%s): %s"
+                           % ("confirmed" if safe_confirmed
+                              else "INCOMPLETE, not fully confirmed", reason))
+            except Exception as exc:                                  # noqa: BLE001
+                # H6: even normalisation/record-building must not raise out of the
+                # abort path. Record it as a NOT-confirmed outcome instead.
+                quality = {
+                    "large_step": False, "step_c": None,
+                    "large_step_c": getattr(self.policy, "large_step_c", None),
+                    "previous_value_c": self._last_value,
+                    "safe_setpoint_c": getattr(self.policy, "safe_setpoint_c", None),
+                    "pid_disable": {"outcome": "unknown"},
+                    "pid_disable_outcome": "unknown",
+                    "safe_write_outcome": None,
+                    "safe_confirmed": False,
+                    "safe_write_error": "safe() body raised %s: %s"
+                                        % (type(exc).__name__, exc),
+                    "safe_summary": "safe() itself raised while going safe; recorded "
+                                    "as NOT confirmed rather than propagated -- an "
+                                    "abort path must not raise (H6).",
+                    "residual_risk": self.HONEST_RESIDUAL,
+                }
+                record = RelayRecord(
+                    t_utc=t_utc, monotonic_s=monotonic_s, forwarded=False,
+                    value_c=None, source_channel="policy.safe_setpoint_c",
+                    reading={}, write=None, safe_mode=True, quality=quality,
+                    reason="SAFE MODE (INCOMPLETE, safe() raised): %s" % reason)
         except Exception as exc:                                      # noqa: BLE001
-            # H6: even normalisation/record-building must not raise out of the
-            # abort path. Record it as a NOT-confirmed outcome instead.
-            quality = {
-                "large_step": False, "step_c": None,
-                "large_step_c": getattr(self.policy, "large_step_c", None),
-                "previous_value_c": self._last_value,
-                "safe_setpoint_c": getattr(self.policy, "safe_setpoint_c", None),
-                "pid_disable": {"outcome": "unknown"},
-                "pid_disable_outcome": "unknown",
-                "safe_write_outcome": None,
-                "safe_confirmed": False,
-                "safe_write_error": "safe() body raised %s: %s"
-                                    % (type(exc).__name__, exc),
-                "safe_summary": "safe() itself raised while going safe; recorded "
-                                "as NOT confirmed rather than propagated -- an "
-                                "abort path must not raise (H6).",
-                "residual_risk": self.HONEST_RESIDUAL,
-            }
+            # H6-complete: even the timestamp calls or the fallback record build
+            # must not propagate. Build a last-resort record from literals that
+            # cannot themselves fail. BaseException is intentionally NOT caught
+            # (see the docstring).
             record = RelayRecord(
-                t_utc=t_utc, monotonic_s=monotonic_s, forwarded=False,
-                value_c=None, source_channel="policy.safe_setpoint_c",
-                reading={}, write=None, safe_mode=True, quality=quality,
-                reason="SAFE MODE (INCOMPLETE, safe() raised): %s" % reason)
+                t_utc="", monotonic_s=0.0, forwarded=False, value_c=None,
+                source_channel="policy.safe_setpoint_c", reading={}, write=None,
+                safe_mode=True,
+                quality={"large_step": False, "step_c": None,
+                         "safe_confirmed": False,
+                         "safe_summary": "safe() double-faulted while going safe "
+                                         "(%s: %s); recorded as NOT confirmed rather "
+                                         "than propagated (H6-complete)."
+                                         % (type(exc).__name__, exc),
+                         "residual_risk": self.HONEST_RESIDUAL},
+                reason="SAFE MODE (INCOMPLETE, safe() double-faulted): %s" % reason)
+        # These two assignments are plain attribute sets on this instance and
+        # cannot raise, so they stay outside the guard; record is always bound.
         self.last_record = record
         self._last_safe = record
         return record
@@ -930,7 +1005,7 @@ class Relay:
                 "Re-arming resumes forwarding the PID output to the bath, which "
                 "is an actuation and must be enabled deliberately.")
         was = self.safe_mode
-        self.safe_mode = False
+        self._safe_mode = False
         self._bad_since = None
         self._write_bad_since = None
         self._rearm_count += 1

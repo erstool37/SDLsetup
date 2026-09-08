@@ -46,6 +46,7 @@ Do not add one on the assumption that a controller must have one.
 from __future__ import annotations
 
 import dataclasses
+import math
 from pathlib import Path
 from typing import Any
 
@@ -144,22 +145,35 @@ class CirculatorSettings:
                 f"parity must be one of {_PARITIES}, got {self.parity!r}. If this is "
                 f"False, config.yaml wrote an UNQUOTED N -- this file's parser reads "
                 f"YAML 1.1 booleans, so it must be written parity: \"N\".")
-        if self.stopbits not in _STOPBITS:
+        # G4: True == 1, so a bare `stopbits: True` would pass `in _STOPBITS`
+        # (1 is a member). Reject the bool explicitly before the membership test.
+        if isinstance(self.stopbits, bool) or self.stopbits not in _STOPBITS:
             raise CirculatorError(
                 f"stopbits must be one of {_STOPBITS}, got {self.stopbits!r}")
-        if self.bytesize not in _BYTESIZES:
+        if isinstance(self.bytesize, bool) or self.bytesize not in _BYTESIZES:
             raise CirculatorError(
                 f"bytesize must be one of {_BYTESIZES}, got {self.bytesize!r}")
-        if not isinstance(self.timeout_s, (int, float)) or self.timeout_s <= 0:
+        # G4: NaN <= 0 and NaN < 0 are both False, so a NaN duration slipped
+        # through the old bound-only checks; require finite and non-bool.
+        if not isinstance(self.timeout_s, (int, float)) \
+                or isinstance(self.timeout_s, bool) \
+                or not math.isfinite(float(self.timeout_s)) or self.timeout_s <= 0:
             raise CirculatorError(
-                f"timeout_s must be a positive number, got {self.timeout_s!r}")
+                f"timeout_s must be a positive finite number, got {self.timeout_s!r}")
         if not isinstance(self.unit_id, int) or isinstance(self.unit_id, bool) \
                 or not 0 <= self.unit_id <= 247:
             raise CirculatorError(
                 f"unit_id must be a Modbus slave id in 0..247, got {self.unit_id!r}")
-        if not isinstance(self.boot_settle_s, (int, float)) or self.boot_settle_s < 0:
+        # G4: a NaN boot_settle_s made the settle deadline NaN, so the boot-window
+        # guard (settle_remaining_s = deadline - now) evaluated to ~0 and a write
+        # was allowed immediately after an MCU reset. Require finite and non-bool.
+        if not isinstance(self.boot_settle_s, (int, float)) \
+                or isinstance(self.boot_settle_s, bool) \
+                or not math.isfinite(float(self.boot_settle_s)) \
+                or self.boot_settle_s < 0:
             raise CirculatorError(
-                f"boot_settle_s must be a non-negative number, got {self.boot_settle_s!r}")
+                f"boot_settle_s must be a non-negative finite number, got "
+                f"{self.boot_settle_s!r}")
         if not isinstance(self.allow_actuation, bool):
             raise CirculatorError(
                 f"allow_actuation must be a bool, got {self.allow_actuation!r}; "

@@ -102,8 +102,10 @@ clearance limits in ``tools/arm/safety.py``: the numbers describe what the rig
 was observed to do, not what an operator prefers today.
 
 Note the asymmetry, which is deliberate: a range of exactly
-``[0.0, 30.0]`` is a legal *range* (it equals the ceiling), while the *values*
-0.0 and 30.0 are not commandable within it.
+``[0.0, 30.0]`` is a legal *range* (it equals the ceiling, and the ceiling is an
+exact float literal, so the range check accepts it with no slop), while the
+*values* 0.0 and 30.0 are not commandable within it. The range check no longer
+tolerates ``EPS`` (G1): ``+EPS`` on the ceiling let a real overshoot construct.
 
 GUARDS RAISE, THEY NEVER CLAMP
 ==============================
@@ -130,11 +132,14 @@ from __future__ import annotations
 import dataclasses
 import math
 
-#: Floating-point slop, used ONLY when checking that a configured *range* sits
-#: within the code ceiling -- so that a range of exactly [0.0, 30.0] is accepted
-#: rather than rejected by representation error. It is deliberately NOT applied
-#: to a commanded value: the value check is strict, and adding slop there would
-#: quietly re-admit the endpoints the strictness exists to refuse.
+#: Retained floating-point-slop constant. G1 (2026-09-08): it is **no longer
+#: applied to the range/ceiling check**. The code ceilings are exact float
+#: literals (0.0, 30.0), so the range check compares against them exactly --
+#: adding +EPS to the ceiling let CommandLimits(max_c=30.0000005) construct and
+#: then let a real (tiny) overshoot pass validate(). It is deliberately NOT
+#: applied to a commanded value either: validate() is strict, and slop there
+#: would re-admit the endpoints the strictness exists to refuse. The name is
+#: kept because it is part of this module's public surface (__all__).
 EPS = 1e-6
 
 #: Code ceiling: the widest RANGE this layer will ever permit. Commandable
@@ -261,7 +266,7 @@ class CommandLimits:
                 f"an OPEN interval, so an empty or inverted range would refuse every "
                 f"value, which reads as a broken device"
             )
-        if self.min_c < COMMAND_MIN_C - EPS or self.max_c > COMMAND_MAX_C + EPS:
+        if self.min_c < COMMAND_MIN_C or self.max_c > COMMAND_MAX_C:
             raise SafetyError(
                 f"[{self.min_c}, {self.max_c}] would WIDEN the command bound past the "
                 f"code ceiling [{COMMAND_MIN_C}, {COMMAND_MAX_C}]. A run may tighten "
