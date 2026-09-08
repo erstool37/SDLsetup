@@ -209,8 +209,17 @@ class BoundedSetpoint:
             )
         if limits is None:
             raise SafetyError("BoundedSetpoint requires the limits that approved it")
-        self.value_c = float(value_c)
-        self.limits = limits
+        object.__setattr__(self, "value_c", float(value_c))
+        object.__setattr__(self, "limits", limits)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise SafetyError(
+            "BoundedSetpoint is immutable: reassigning its value after validation "
+            "would bypass the bound the token exists to prove. Call "
+            "CommandLimits.validate() again for a new value.")
+
+    def __delattr__(self, name: str) -> None:
+        raise SafetyError("BoundedSetpoint is immutable; attributes cannot be deleted")
 
     def __repr__(self) -> str:
         return (f"BoundedSetpoint({self.value_c:g} C, strictly within "

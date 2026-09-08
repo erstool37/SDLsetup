@@ -128,10 +128,19 @@ class BoundedSetpoint:
                 "BoundedSetpoint() may only be created by "
                 "SetpointLimits.validate(); constructing one directly would "
                 "bypass every setpoint bound")
-        self.field = str(field)
-        self.value = float(value)
-        self.spec = spec
-        self.limits = limits
+        object.__setattr__(self, "field", str(field))
+        object.__setattr__(self, "value", float(value))
+        object.__setattr__(self, "spec", spec)
+        object.__setattr__(self, "limits", limits)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise SafetyError(
+            "BoundedSetpoint is immutable: reassigning value/field/spec after "
+            "validation would bypass the bound (or redirect the write to a "
+            "read-only register). Call SetpointLimits.validate() again.")
+
+    def __delattr__(self, name: str) -> None:
+        raise SafetyError("BoundedSetpoint is immutable; attributes cannot be deleted")
 
     @property
     def address(self) -> int:
