@@ -18,6 +18,7 @@ check short of building the lab caught it. So this file builds the lab and calls
 """
 from __future__ import annotations
 
+import math
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +27,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from tools import config as _config  # noqa: E402
+from tools.circulator.api import CirculatorSettings  # noqa: E402
 from tools.environment import plc as _plc  # noqa: E402
 from tools.environment.api import EnvironmentNode, PlcSettings  # noqa: E402
 
@@ -121,9 +123,27 @@ blank = _config.load_yaml(CONFIG_PATH).get("circulator", {})
 ok(blank.get("port") == {},
    "circulator.port is blank on purpose and parses to an EMPTY MAPPING",
    repr(blank.get("port")))
-ok(blank.get("safe_setpoint_c") == {},
-   "so does circulator.safe_setpoint_c -- and {} is FALSY, so `if value:` reads it "
-   "as absent", repr(blank.get("safe_setpoint_c")))
+# The trap itself is demonstrated on a SYNTHETIC blank key, not on the live
+# config: safe_setpoint_c is an operator decision (set 2026-09-08), and a test
+# that required it to stay blank would fail the moment someone made it.
+with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as _fh:
+    _fh.write("circulator:\n  safe_setpoint_c:\n  port:\n")
+    _blank_path = Path(_fh.name)
+try:
+    _synthetic = _config.load_yaml(_blank_path).get("circulator", {})
+finally:
+    _blank_path.unlink(missing_ok=True)
+ok(_synthetic.get("safe_setpoint_c") == {},
+   "a BLANK safe_setpoint_c parses to an EMPTY MAPPING -- and {} is FALSY, so "
+   "`if value:` reads it as absent", repr(_synthetic.get("safe_setpoint_c")))
+_live = blank.get("safe_setpoint_c")
+ok(isinstance(_live, float) and math.isfinite(_live),
+   "the LIVE safe_setpoint_c is a finite number (operator set it), not a blank",
+   repr(_live))
+_lim = CirculatorSettings.from_config().limits
+ok(isinstance(_live, float) and _lim.min_c < _live < _lim.max_c,
+   "and it lies strictly inside the RESOLVED circulator bound",
+   "%r in (%g, %g)" % (_live, _lim.min_c, _lim.max_c))
 raises(_config.ConfigError,
        lambda: PlcSettings.from_config({"environment": {"timeout_s": {}}}),
        "an empty environment key is present-and-unusable, and raises")

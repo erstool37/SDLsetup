@@ -287,7 +287,10 @@ circulator:
   # starts, which closes the gap for that script only.
   # TODO(operator): declare the comms-loss safe bath setpoint, in degC,
   # strictly inside (10.0, 30.0).
-  safe_setpoint_c:
+  safe_setpoint_c: 29.9   # OPERATOR 2026-09-08: asked for 30; 30.0 is the OPEN-interval ceiling
+                          # (= PLC DF20 Temp Output UB, and the MATLAB GUI refused it), so the nearest
+                          # legal value is used. Operator states comms will not drop; this is the
+                          # HOTTEST permitted fallback, which is unusual for a fail-safe -- recorded.
 
   # No verified write for this long -> turn the PID off and RAISE. Same absent
   # watchdog, same 2026-01-11 saturated-output log, as environment.plc_stale_s.
