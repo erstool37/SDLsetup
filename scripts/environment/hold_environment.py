@@ -122,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="what to do after a watchdog fires and the fail-safe "
                          "has run: stop the run non-zero (default), or keep "
                          "polling in safe mode without ever re-enabling the PID")
+    ap.add_argument("--enable-pid", action="store_true",
+                    help="enable the PLC PID loop (coil C1) ONCE, after the "
+                         "setpoint writes and before the hold loop. Live "
+                         "only; ignored in a dry run. A plain hold leaves C1 "
+                         "untouched -- this is what a full kinetics run adds")
     ap.add_argument("--config", default=str(REPO / "configs" / "config.yaml"),
                     help="config file to resolve settings from")
     return ap
@@ -332,6 +337,25 @@ def run(args: argparse.Namespace) -> int:
                                     "been holding a different setpoint than "
                                     "this run asked for.")
                     exit_code = 1
+
+                # A kinetics run must CLOSE the loop; a plain hold does not.
+                # Enabled once here, in-session, after the setpoints and
+                # before the loop. Live only -- a dry run enables no PID.
+                if getattr(args, "enable_pid", False):
+                    if live:
+                        pid_res = env.enable_pid(args.config, client=client)
+                        record_run.record(DEVICE, "pid_enable", pid_res.as_dict())
+                        record_run.log("enable PID (C1): %s" % pid_res.describe(),
+                                       device=DEVICE)
+                        print(pid_res.describe())
+                        if pid_res.outcome == env.FAILED:
+                            record_run.note("--enable-pid FAILED (%r); the PLC "
+                                            "loop may not be closed."
+                                            % pid_res.error)
+                            exit_code = 1
+                    else:
+                        record_run.note("--enable-pid was requested but this "
+                                        "is a DRY RUN; the PID was NOT enabled.")
 
                 if args.no_relay:
                     deadline = time.monotonic() + args.duration
