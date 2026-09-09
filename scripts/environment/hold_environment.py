@@ -223,7 +223,16 @@ def _write_setpoints(args: argparse.Namespace, client: env.PlcClient,
     return all_good
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, *, _plc_transport: object = None,
+        _circ_transport: object = None) -> int:
+    """Hold the chamber, relaying DF9 to the bath.
+
+    ``_plc_transport`` / ``_circ_transport`` are a TEST-ONLY seam: when given,
+    they are injected as the Modbus and serial transports so a test can drive
+    this runner end-to-end over FakePlc/FakeSerial without opening a socket or
+    the circulator's port (opening that port resets the MCU). Both default to
+    ``None`` -- the real ``main()`` path builds real clients.
+    """
     if args.duration <= 0.0:
         print("--duration must be positive", file=sys.stderr)
         return 2
@@ -325,12 +334,26 @@ def run(args: argparse.Namespace) -> int:
         # and claiming per-iteration would let another client in between two of
         # them.
         with occupancy.claim(DEVICE, doing="%s (live=%r)" % (PHASE, live)):
-            client = env.PlcClient(plc_settings)
+            client = env.PlcClient(plc_settings, _plc_transport)
+            # ARM THE INTERLOCK BEFORE ANY ACTUATING CALL. The relay -- and the
+            # bath it drives -- are built here, AHEAD of the setpoint writes and
+            # the port open, so a crash ANYWHERE in the setup below still reaches
+            # `finally: relay.safe()`, which disables the PID. The live run that
+            # motivated this enabled the PID and then crashed opening the port;
+            # with no relay yet built, the finally had nothing to turn C1 off
+            # with, and the PLC was left with its PID ENABLED. Constructing a
+            # Circulator/Relay does not actuate: no port is opened and no coil is
+            # written until the guarded calls below.
+            if not args.no_relay:
+                bath_device = circ.Circulator(
+                    bath_settings, _circ_transport, log=record_run.logger(BATH))
+                relay = env.Relay(client, bath_device, policy)
             try:
                 opened = client.connect()
                 record_run.log("connect -> %r (last_error=%r)"
                                % (opened, client.last_error), device=DEVICE)
 
+                # (1) setpoints -- the first actuating step in a live run.
                 if not _write_setpoints(args, client, record_run, live):
                     record_run.note("a setpoint write was not confirmed; the "
                                     "hold loop ran anyway, so the PLC may have "
@@ -338,25 +361,49 @@ def run(args: argparse.Namespace) -> int:
                                     "this run asked for.")
                     exit_code = 1
 
-                # A kinetics run must CLOSE the loop; a plain hold does not.
-                # Enabled once here, in-session, after the setpoints and
-                # before the loop. Live only -- a dry run enables no PID.
+                # (2) open the bath port. Opening it hardware-RESETS the MCU, so
+                # it is done ONCE, here, explicitly -- never on demand from
+                # inside the loop.
+                if not args.no_relay and live:
+                    record_run.log("opening the serial port -- this RESETS "
+                                   "the MCU", device=BATH)
+                    record_run.record(BATH, "port", bath_device.open())
+
+                # (3)+(4) enable the PID LAST -- only after the setpoints are
+                # written, the bath port is open, the relay is built, and a first
+                # live PLC read succeeds. A kinetics run must CLOSE the loop; a
+                # plain hold does not. Enabling it last means that if any earlier
+                # step failed, the PID was never enabled and there is nothing to
+                # leave unsafe -- and if it IS enabled, the relay built above is
+                # already in place to disable it in `finally`.
                 if getattr(args, "enable_pid", False):
-                    if live:
-                        pid_res = env.enable_pid(args.config, client=client)
-                        record_run.record(DEVICE, "pid_enable", pid_res.as_dict())
-                        record_run.log("enable PID (C1): %s" % pid_res.describe(),
-                                       device=DEVICE)
-                        print(pid_res.describe())
-                        if pid_res.outcome == env.FAILED:
-                            record_run.note("--enable-pid FAILED (%r); the PLC "
-                                            "loop may not be closed."
-                                            % pid_res.error)
-                            exit_code = 1
-                    else:
+                    if not live:
                         record_run.note("--enable-pid was requested but this "
                                         "is a DRY RUN; the PID was NOT enabled.")
+                    else:
+                        first = client.read_block()
+                        record_run.record(DEVICE, "readings", first.as_dict())
+                        if first.read_ok is not True:
+                            record_run.note(
+                                "--enable-pid was requested but the first PLC "
+                                "read did not succeed (last_error=%r); the PID "
+                                "was NOT enabled, so nothing was left in an "
+                                "actuated state." % client.last_error)
+                            exit_code = 1
+                        else:
+                            pid_res = env.enable_pid(args.config, client=client)
+                            record_run.record(DEVICE, "pid_enable",
+                                              pid_res.as_dict())
+                            record_run.log("enable PID (C1): %s"
+                                           % pid_res.describe(), device=DEVICE)
+                            print(pid_res.describe())
+                            if pid_res.outcome == env.FAILED:
+                                record_run.note("--enable-pid FAILED (%r); the "
+                                                "PLC loop may not be closed."
+                                                % pid_res.error)
+                                exit_code = 1
 
+                # (5) the loop.
                 if args.no_relay:
                     deadline = time.monotonic() + args.duration
                     while time.monotonic() < deadline:
@@ -368,16 +415,6 @@ def run(args: argparse.Namespace) -> int:
                                  reading.pid_enabled))
                         time.sleep(period)
                 else:
-                    bath_device = circ.Circulator(
-                        bath_settings, log=record_run.logger(BATH))
-                    if live:
-                        # Opening the port hardware-RESETS the MCU, so it is
-                        # done ONCE, here, explicitly -- never on demand from
-                        # inside the loop.
-                        record_run.log("opening the serial port -- this RESETS "
-                                       "the MCU", device=BATH)
-                        record_run.record(BATH, "port", bath_device.open())
-                    relay = env.Relay(client, bath_device, policy)
                     forwarded, refused, exit_code, status = _hold(
                         relay, record_run, args, period, exit_code)
             finally:

@@ -253,8 +253,19 @@ class Run:
             print(message, flush=True)
 
     def logger(self, device: str):
-        """A one-argument callable to hand a device as its ``log=``."""
-        return lambda message: self.log(str(message).rstrip(), device=device)
+        """A callable to hand a device as its ``log=``.
+
+        Accepts ``(message)`` OR ``(message, level)``. A device's log callback
+        may pass a level alongside the message -- the circulator link's
+        ``_emit`` calls ``log_fn(message, level)`` -- so the returned callable
+        must take one too, or a warn-level line from the device crashes the run
+        with ``TypeError: <lambda>() takes 1 positional argument but 2 were
+        given``. The level defaults to ``"info"`` for callers that pass only a
+        message, and is threaded into :meth:`log` so a device warning stays a
+        warning in the transcript.
+        """
+        return lambda message, level="info": self.log(
+            str(message).rstrip(), device=device, level=level)
 
     # -- records ----------------------------------------------------------------
     def record(self, device: str, stream: str, payload: dict) -> Path:
