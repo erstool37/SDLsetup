@@ -122,6 +122,38 @@ PAGE = r"""<!doctype html>
 .bench-note{margin-top:6px;font-size:10px;color:#6b7383;line-height:1.35}
 .bench-note.hot{color:#ff8b6a}
 @media (prefers-reduced-motion: reduce){.slot.busy .pulse{animation:none}}
+/* ---- Droplet Kinetics tab (scoped) ---------------------------------- */
+.kin-cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+@media(max-width:900px){.kin-cols{grid-template-columns:1fr}}
+.kin-h{font-size:14px;margin:6px 0 8px;font-weight:700}
+.kin-sub{font-size:11px;color:var(--muted);font-weight:400}
+.kin-control{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:520px){.kin-control{grid-template-columns:1fr}}
+.kstat{border:1px solid var(--line);background:var(--panel);padding:10px 12px}
+.kstat.wide{grid-column:1 / -1}
+.kstat .lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.kstat .knum{font-size:22px;font-weight:700;color:var(--text);line-height:1.25}
+.kstat .kunit{font-size:12px;color:var(--muted);font-weight:400}
+.kstat .ksub{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
+.kpill{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:10px;border:1px solid var(--line);color:var(--muted)}
+.kpill.ok{color:var(--ok);border-color:var(--ok)}
+.kpill.warn{color:var(--warn);border-color:var(--warn)}
+.kpill.err{color:var(--err);border-color:var(--err)}
+.kpill.neu{color:var(--muted);border-color:var(--line)}
+.kin-card{border:1px solid var(--line);background:var(--panel);padding:10px;margin-bottom:10px}
+.kin-clabel{font-size:12px;color:var(--muted);margin-bottom:6px}
+.kchart{width:100%;height:170px;display:block}
+.kin-readiness{border:1px solid var(--line);background:var(--panel);padding:12px;margin-bottom:14px}
+.kin-status-line{font-size:14px;font-weight:700;margin-bottom:6px}
+.kin-why{font-size:12px;color:var(--muted);line-height:1.5;margin-bottom:10px}
+.kin-inrow{display:flex;align-items:center;gap:8px;font-size:13px;padding:5px 0;border-top:1px solid var(--line)}
+.kin-inrow .yes{color:var(--ok);font-weight:700;width:16px;text-align:center}
+.kin-inrow .no{color:var(--err);font-weight:700;width:16px;text-align:center}
+.kin-inrow .what{flex:1}
+.kin-inrow .det{color:var(--muted);font-size:12px}
+.kin-note{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5}
+.kin-cams{margin-top:4px}
+
 </style>
 </head>
 <body>
@@ -131,6 +163,7 @@ PAGE = r"""<!doctype html>
     <div class="tab active" data-view="overview">Overview</div>
     <div class="tab" data-view="cameras">Cameras</div>
     <div class="tab" data-view="cctv">CCTV</div>
+    <div class="tab" data-view="kinetics">Droplet Kinetics</div>
   </div>
   <span id="clock">connecting…</span>
 </header>
@@ -181,6 +214,33 @@ PAGE = r"""<!doctype html>
     <div class="cam-grid">
       <div class="cam"><div class="h"><span>Whole-setup overview</span><span class="pill" id="cctv-state">—</span></div>
         <div class="wrap"><div class="placeholder">CCTV node is vacant.<br>Wire a USB/IP overview camera in <code>tools/cctv</code>.</div></div></div>
+    </div>
+  </section>
+  <section id="kinetics" class="view">
+    <div class="kin-cols">
+      <div class="kin-col">
+        <h2 class="kin-h">제어 상태 <span class="kin-sub">(실측 / from /api/status)</span></h2>
+        <div id="kin-control" class="kin-control"><div class="kstat wide"><div class="ksub">상태 수신 대기 중…</div></div></div>
+      </div>
+      <div class="kin-col">
+        <h2 class="kin-h">추세 <span class="kin-sub">(클라이언트 누적, 최근 300 샘플)</span></h2>
+        <div class="kin-card">
+          <div class="kin-clabel">온도(실선) · 설정값(점선) — °C</div>
+          <canvas id="kin-chart-temp" class="kchart"></canvas>
+        </div>
+        <div class="kin-card">
+          <div class="kin-clabel">습도(실선) · 설정값(점선) — %RH</div>
+          <canvas id="kin-chart-rh" class="kchart"></canvas>
+        </div>
+      </div>
+    </div>
+    <h2 class="kin-h">Kinetics 준비 상태</h2>
+    <div id="kin-readiness" class="kin-readiness"></div>
+    <div class="cam-grid kin-cams">
+      <div class="cam"><div class="h"><span>Leica K3C</span><span class="pill" id="kin-age-leica">—</span></div>
+        <div class="wrap"><img id="kin-img-leica" alt="Leica"></div></div>
+      <div class="cam"><div class="h"><span>TIS DFK 33UX264</span><span class="pill" id="kin-age-tis">—</span></div>
+        <div class="wrap"><img id="kin-img-tis" alt="TIS"></div></div>
     </div>
   </section>
 </main>
@@ -377,6 +437,7 @@ async function pollStatus(){
   try{const r=await fetch("/api/status");const d=await r.json();
     renderCards(d.nodes); renderMotion(d.occupancy);
     renderBench(d.nodes, d.occupancy);
+    onStatus(d);
     $("clock").textContent="updated "+fmtTime(d.ts);
     const cam=Object.values(d.nodes).find(n=>n.kind==="camera");
     if(cam){const rec=cam.recording===true; $("rec-pill").textContent="recording: "+(rec?"ON":"off");
@@ -414,6 +475,167 @@ async function cmd(action,btn){
 $("btn-start").onclick=e=>cmd("start_record",e.target);
 $("btn-pause").onclick=e=>cmd("pause_record",e.target);
 $("btn-photo").onclick=e=>cmd("take_photo",e.target);
+
+
+/* ---- Droplet Kinetics tab -------------------------------------------
+   Reads ONLY /api/status (never opens its own PLC/Modbus session -- the
+   CLICK caps at 3 concurrent clients). All numbers below are real fields
+   published by tools.environment.node / tools.circulator.node. There is
+   NO kinetics computation anywhere in the repo, so the readiness panel
+   shows availability only and displays no volume/count/rate number.    */
+const TREND = [];              // client-side ring buffer of /api/status samples
+const TREND_CAP = 300;
+function knum(v, dgt){return (typeof v==="number" && isFinite(v)) ? v.toFixed(dgt==null?2:dgt) : "—";}
+function kpill(txt, cls){return '<span class="kpill '+cls+'">'+txt+'</span>';}
+function pushTrend(ts, env){
+  const n = v => (typeof v==="number" && isFinite(v)) ? v : null;
+  TREND.push({t:ts, temp:n(env.temp_c), tempSp:n(env.temp_sp_c),
+              rh:n(env.rh_pct), rhSp:n(env.rh_sp_pct)});
+  while(TREND.length > TREND_CAP) TREND.shift();
+}
+function onStatus(d){
+  const nodes = d.nodes || {};
+  const env  = Object.values(nodes).find(n=>n.kind==="environment");
+  const circ = Object.values(nodes).find(n=>n.kind==="circulator");
+  const cam  = Object.values(nodes).find(n=>n.kind==="camera");
+  if(env) pushTrend(d.ts, env);
+  renderKinControl(env, circ);
+  renderKinReadiness(env, cam);
+  if($("kinetics").classList.contains("active")) drawTrends();
+}
+function renderKinControl(env, circ){
+  const el = $("kin-control"); if(!el) return;
+  if(!env){ el.innerHTML = '<div class="kstat wide"><div class="ksub">environment 노드를 찾지 못했습니다.</div></div>'; return; }
+  // temp / rh errors only when both value and setpoint are numeric
+  const tErr = (typeof env.temp_c==="number" && typeof env.temp_sp_c==="number") ? (env.temp_c-env.temp_sp_c) : null;
+  const hErr = (typeof env.rh_pct==="number" && typeof env.rh_sp_pct==="number") ? (env.rh_pct-env.rh_sp_pct) : null;
+  // PID pill
+  let pid;
+  if(env.pid_enabled===true)  pid = kpill("PID ON","ok");
+  else if(env.pid_enabled===false) pid = kpill("PID OFF","neu");
+  else pid = kpill("UNKNOWN (not read)","warn");
+  // in-range pill
+  let ir;
+  if(env.in_range===true) ir = kpill("범위 내","ok");
+  else if(env.in_range===false) ir = kpill("범위 밖","err");
+  else ir = kpill("미정 (허용오차 미설정)","neu");
+  // freshness / live-poll honesty
+  const stale = (typeof env.age_s==="number" && typeof env.stale_after_s==="number" && env.age_s>env.stale_after_s);
+  let live;
+  if(env.dashboard_poll_plc===false || env.poll_skipped) live = kpill("라이브 폴링 꺼짐 / no live poll","neu");
+  else if(env.polled_plc===true) live = kpill("라이브 폴링 중","ok");
+  else live = kpill("폴링 상태 미상","neu");
+  const agePill = (env.age_s==null) ? kpill("age 미상","neu")
+                 : kpill("age "+knum(env.age_s,1)+"s"+(stale?" (STALE)":""), stale?"err":"ok");
+  let clim;
+  if(env.clients_limit_reached===true) clim = kpill("클라이언트 한도 도달","err");
+  else if(env.clients_limit_reached===false) clim = kpill("클라이언트 한도 여유","ok");
+  else clim = kpill("클라이언트 한도 미상","neu");
+  const skipNote = env.poll_skipped ? '<div class="ksub">'+env.poll_skipped+'</div>' : "";
+  // circulator block
+  let circHtml;
+  if(!circ){ circHtml = '<div class="kstat wide"><div class="lbl">순환기 (수조)</div><div class="ksub">circulator 노드를 찾지 못했습니다.</div></div>'; }
+  else {
+    const pp = circ.port_present===true ? kpill("포트 있음","ok") : kpill("포트 없음","warn");
+    const lk = circ.link_open===true ? kpill("링크 열림","ok") : kpill("링크 닫힘","neu");
+    const rng = Array.isArray(circ.command_range_c) ? (circ.command_range_c[0]+"–"+circ.command_range_c[1]+" °C") : "—";
+    circHtml =
+      '<div class="kstat wide"><div class="lbl">순환기 (수조 온도 액추에이터)</div>'
+      + '<div class="ksub">'+pp+' '+lk+' &nbsp; 명령 범위 <b>'+rng+'</b> &nbsp; open_count <b>'+(circ.open_count==null?"—":circ.open_count)+'</b></div>'
+      + '<div class="ksub">'+kpill("수조 온도 읽기 없음 (쓰기 전용)","neu")+' &nbsp; readback: '+(circ.readback==null?"—":circ.readback)+'</div></div>';
+  }
+  el.innerHTML =
+    '<div class="kstat"><div class="lbl">온도 (temp_c)</div>'
+    + '<div class="knum">'+knum(env.temp_c,1)+'<span class="kunit"> °C</span></div>'
+    + '<div class="ksub">설정값 <b>'+knum(env.temp_sp_c,1)+' °C</b> · 오차 <b>'+(tErr==null?"—":(tErr>=0?"+":"")+tErr.toFixed(2)+" °C")+'</b></div></div>'
+    + '<div class="kstat"><div class="lbl">습도 (rh_pct)</div>'
+    + '<div class="knum">'+knum(env.rh_pct,1)+'<span class="kunit"> %RH</span></div>'
+    + '<div class="ksub">설정값 <b>'+knum(env.rh_sp_pct,1)+' %RH</b> · 오차 <b>'+(hErr==null?"—":(hErr>=0?"+":"")+hErr.toFixed(2)+" %")+'</b></div></div>'
+    + '<div class="kstat"><div class="lbl">PID (C1)</div><div class="ksub">'+pid+'</div>'
+    + '<div class="ksub">출력(DF9/DF10)은 status에 없음 — 미표시</div></div>'
+    + '<div class="kstat"><div class="lbl">범위 / 신선도</div><div class="ksub">'+ir+' '+agePill+'</div>'
+    + '<div class="ksub">'+live+' '+clim+'</div>'+skipNote+'</div>'
+    + circHtml;
+}
+function camReach(cam, c){
+  return !!(cam && cam.cameras && cam.cameras[c] && typeof cam.cameras[c].age_s === "number");
+}
+function renderKinReadiness(env, cam){
+  const el = $("kin-readiness"); if(!el) return;
+  const leica = camReach(cam,"leica"), tis = camReach(cam,"tis");
+  const ageTxt = (cam,c) => camReach(cam,c) ? (cam.cameras[c].age_s+"s ago") : "offline";
+  const envRec = (typeof (env&&env.temp_c) === "number") || (typeof (env&&env.rh_pct) === "number");
+  function row(ok, what, det){
+    return '<div class="kin-inrow"><span class="'+(ok?"yes":"no")+'">'+(ok?"✓":"✗")+'</span>'
+      + '<span class="what">'+what+'</span><span class="det">'+det+'</span></div>';
+  }
+  el.innerHTML =
+    '<div class="kin-status-line">'+kpill("결정화 kinetics 계산: 미연결 (NOT WIRED)","err")+'</div>'
+    + '<div class="kin-why">유일한 구현은 <code>combination_side.m</code> (MATLAB, 측면 이미지→방울 부피)이며 포팅·연결되지 않았습니다. '
+    + '핵 생성/성장/결정 개수/속도 계산 코드는 저장소에 존재하지 않습니다. 따라서 부피·개수·속도 수치는 표시하지 않습니다.</div>'
+    + '<div class="kin-status-line" style="font-size:12px">필요 입력의 현재 가용성 (실제 신호 기준)</div>'
+    + row(leica, "라이브 이미지 — Leica K3C (/camera/leica)", ageTxt(cam,"leica"))
+    + row(tis,   "라이브 이미지 — TIS DFK 33UX264 (/camera/tis)", ageTxt(cam,"tis"))
+    + row(envRec, "환경 T/RH 상태값 (environment status)",
+          envRec ? "published 상태값 있음" : "상태값 없음")
+    + '<div class="kin-note">참고 이미징 주기(레퍼런스 GUI): 수평 12–30 s · 수직 5 min. 카메라-촬영방향 매핑은 이 페이지에서 확인되지 않았습니다.<br>'
+    + '지속 환경 로그(run readings.jsonl)는 run이 기록하며 이 상태 페이지에서는 존재 여부를 확인할 수 없습니다.</div>';
+}
+function drawLineChart(cv, series, unit){
+  const ctx = cv.getContext("2d"); if(!ctx) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth || 300, h = cv.clientHeight || 170;
+  cv.width = w*dpr; cv.height = h*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  let vals = [];
+  series.forEach(s => s.data.forEach(v => { if(v!=null) vals.push(v); }));
+  if(vals.length === 0){ ctx.fillStyle="#90a0b0"; ctx.font="12px Arial";
+    ctx.fillText("데이터 수집 중…", 12, 22); return; }
+  let mn = Math.min(...vals), mx = Math.max(...vals);
+  if(mn === mx){ mn -= 1; mx += 1; }
+  const padL=42, padR=10, padT=12, padB=18;
+  const n = Math.max(2, series[0].data.length);
+  const X = i => padL + (w-padL-padR) * (n<=1 ? 0 : i/(n-1));
+  const Y = v => padT + (h-padT-padB) * (1 - (v-mn)/(mx-mn));
+  ctx.strokeStyle="#26313c"; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(padL,padT); ctx.lineTo(padL,h-padB); ctx.lineTo(w-padR,h-padB); ctx.stroke();
+  ctx.fillStyle="#90a0b0"; ctx.font="10px Arial";
+  ctx.fillText(mx.toFixed(1), 4, padT+8);
+  ctx.fillText(mn.toFixed(1), 4, h-padB);
+  ctx.fillText(unit, 4, (padT+h-padB)/2);
+  series.forEach(s => {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.6;
+    ctx.setLineDash(s.dashed ? [5,4] : []);
+    ctx.beginPath(); let started = false;
+    s.data.forEach((v,i) => {
+      if(v == null){ started = false; return; }
+      const x = X(i), y = Y(v);
+      if(!started){ ctx.moveTo(x,y); started = true; } else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
+}
+function drawTrends(){
+  const cT = $("kin-chart-temp");
+  if(cT) drawLineChart(cT, [
+    {data:TREND.map(p=>p.temp),   color:"#e0b341", dashed:false},
+    {data:TREND.map(p=>p.tempSp), color:"#90a0b0", dashed:true}], "°C");
+  const cH = $("kin-chart-rh");
+  if(cH) drawLineChart(cH, [
+    {data:TREND.map(p=>p.rh),   color:"#5fb3d4", dashed:false},
+    {data:TREND.map(p=>p.rhSp), color:"#90a0b0", dashed:true}], "%RH");
+}
+function refreshKinCams(){
+  if(!$("kinetics").classList.contains("active")) return;
+  const t = Date.now();
+  $("kin-img-leica").src = "/camera/leica?t=" + t;
+  $("kin-img-tis").src   = "/camera/tis?t=" + t;
+}
+const kinTab = document.querySelector('.tab[data-view="kinetics"]');
+if(kinTab) kinTab.addEventListener("click", () => { drawTrends(); refreshKinCams(); });
+window.addEventListener("resize", () => { if($("kinetics").classList.contains("active")) drawTrends(); });
+setInterval(refreshKinCams, 1000);
 
 pollStatus(); setInterval(pollStatus,2000);
 connectSSE(); setInterval(refreshCams,1000);
