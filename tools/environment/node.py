@@ -159,6 +159,10 @@ class EnvironmentNode(Node):
         rh = channels.get("rh_filtered_pct")
         temp_sp = channels.get("temp_sp_c")
         rh_sp = channels.get("rh_sp_pct")
+        # DF9 / DF10, from the same reading -- read-only, published so the
+        # Chamber Control PWM-duty trend can be drawn. Not a second session.
+        temp_pid_output_c = channels.get("temp_pid_output_c")
+        rh_pid_output_pct = channels.get("rh_pid_output_pct")
         age_s = (published or {}).get("age_s")
         pid = (published or {}).get("pid_enabled")
 
@@ -185,6 +189,8 @@ class EnvironmentNode(Node):
             temp_sp_c=temp_sp,
             rh_pct=rh,
             rh_sp_pct=rh_sp,
+            temp_pid_output_c=temp_pid_output_c,
+            rh_pid_output_pct=rh_pid_output_pct,
             in_range=self._in_range(temp, temp_sp, rh, rh_sp),
             in_range_tolerance={"temp_c": self.in_range_tol_c,
                                 "rh_pct": self.in_range_tol_pct,
