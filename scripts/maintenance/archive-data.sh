@@ -53,7 +53,7 @@ STATE_VOLATILE_RE='(environment/last_reading\.json|occupancy/.*\.json|microscope
 # /mnt/c is 9p/drvfs mounted WITHOUT the metadata option (verified 2026-09-10),
 # so ownership and mode cannot be set there. Plain -a asks for -o -g and can
 # abort the whole archive over cosmetics.
-RSYNC_FLAGS="-rlptD --no-owner --no-group"
+RSYNC_FLAGS="-rlptD --no-owner --no-group --omit-dir-times --modify-window=1"
 
 STALE_AFTER_DAYS=7
 
@@ -71,11 +71,17 @@ done
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOCK="$ARCHIVE_ROOT/.lock"
 LOCK_HELD=0
+TMPFILES=""
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'ARCHIVE FAILED: %s\n' "$*" >&2; exit 1; }
 
-cleanup() { [ "$LOCK_HELD" -eq 1 ] && rmdir "$LOCK" 2>/dev/null; return 0; }
+cleanup() {
+  # shellcheck disable=SC2086
+  [ -n "$TMPFILES" ] && rm -f $TMPFILES 2>/dev/null
+  [ "$LOCK_HELD" -eq 1 ] && rmdir "$LOCK" 2>/dev/null
+  return 0
+}
 trap cleanup EXIT
 # Without this, a failing $(...) kills the script with a bare status and no
 # message -- non-zero, but not "say so loudly".
@@ -130,8 +136,9 @@ DATASET_SRC=$(readlink -f "$DATASET_SRC") || die "cannot resolve dataset path"
 if [ "$CHECK" -eq 0 ] && [ "$DRY" -eq 0 ]; then
   mkdir -p "$ARCHIVE_ROOT/state" "$ARCHIVE_ROOT/dataset" "$ARCHIVE_ROOT/bin" \
     || die "cannot create archive tree under $ARCHIVE_ROOT"
-  touch "$ARCHIVE_ROOT/.wtest" 2>/dev/null || die "archive root $ARCHIVE_ROOT is not writable"
-  rm -f "$ARCHIVE_ROOT/.wtest"
+  WPROBE="$ARCHIVE_ROOT/.wtest.$$"
+  touch "$WPROBE" 2>/dev/null || die "archive root $ARCHIVE_ROOT is not writable"
+  rm -f "$WPROBE"   # our own probe, uniquely named, never a pre-existing file
   mkdir "$LOCK" 2>/dev/null || die "another archive run holds $LOCK -- refusing to run two at once"
   LOCK_HELD=1
 fi
@@ -242,12 +249,24 @@ else
   say "        verified $checked files by hash"
   [ "$recopied" -eq 0 ] || say "        re-copied $recopied file(s) that changed mid-snapshot"
 
-  # LAST. .treehash is the completeness marker: written only after
-  # verification passes, so a failed or interrupted snapshot can never be
-  # mistaken for a good one, and a failure can never make the next run report
-  # "unchanged" over bad data.
-  printf '%s\n' "$CUR_HASH" > "$SNAP_DEST/.treehash"
-  SNAP_RESULT="snapshot $STAMP"
+  # The hash, the copy and the verify all ran against a live tree. A file
+  # created after find traversed it would be neither copied nor verified, and
+  # the run would still succeed. Re-hash and require the taught state to have
+  # held still; if it moved, keep the snapshot (nothing is ever discarded) but
+  # withhold the completeness marker so the next run takes a clean one.
+  POST_HASH=$(state_tree_hash "$STATE_SRC")
+  if [ "$POST_HASH" != "$CUR_HASH" ]; then
+    say "        taught state MOVED during the snapshot -- keeping it, but not marking it"
+    say "        complete; the next run will take a clean one"
+    SNAP_RESULT="snapshot $STAMP (unmarked: source moved mid-copy)"
+  else
+    # LAST. .treehash is the completeness marker: written only after
+    # verification passes, so a failed or interrupted snapshot can never be
+    # mistaken for a good one, and a failure can never make the next run
+    # report "unchanged" over bad data.
+    printf '%s\n' "$CUR_HASH" > "$SNAP_DEST/.treehash"
+    SNAP_RESULT="snapshot $STAMP"
+  fi
 fi
 
 # ------------------------------------------------- tier 2: dataset mirror
@@ -258,6 +277,34 @@ if [ "$DRY" -eq 1 ]; then
   rsync $RSYNC_FLAGS -n --info=stats2 "$DATASET_SRC/" "$ARCHIVE_ROOT/dataset/" | tail -6
   MIRROR_RESULT="dry-run"
 else
+  # Omitting --delete makes rsync additive for NEW paths only. It still
+  # REPLACES a file at a path that already exists, so the 4046-to-2-byte
+  # truncation propagates into tier 2 exactly as it would have into tier 1.
+  # Growth here is legitimate (a run.log archived mid-run gains lines);
+  # shrinkage is not. Copy the archive's current version aside before anything
+  # overwrites it with something smaller, so a truncation costs nothing.
+  PENDING=$(mktemp); TMPFILES="$TMPFILES $PENDING"
+  # shellcheck disable=SC2086
+  rsync $RSYNC_FLAGS -n --out-format='%n' "$DATASET_SRC/" "$ARCHIVE_ROOT/dataset/" > "$PENDING" \
+    || die "could not compute the pending transfer list"
+  JOURNAL="$ARCHIVE_ROOT/superseded/$STAMP"
+  shrunk=0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    case "$rel" in */) continue ;; esac
+    src="$DATASET_SRC/$rel"; dst="$ARCHIVE_ROOT/dataset/$rel"
+    [ -f "$src" ] && [ -f "$dst" ] || continue
+    sz_s=$(stat -c %s "$src" 2>/dev/null || echo 0)
+    sz_d=$(stat -c %s "$dst" 2>/dev/null || echo 0)
+    if [ "$sz_s" -lt "$sz_d" ]; then
+      mkdir -p "$(dirname "$JOURNAL/$rel")"
+      cp -p "$dst" "$JOURNAL/$rel" || die "could not preserve $rel before it is overwritten by a smaller version"
+      say "        SHRANK: $rel ($sz_d -> $sz_s bytes); previous version kept in superseded/$STAMP"
+      shrunk=$((shrunk+1))
+    fi
+  done < "$PENDING"
+  [ "$shrunk" -eq 0 ] || say "        journalled $shrunk file(s) that were about to shrink"
+
   # shellcheck disable=SC2086
   rsync $RSYNC_FLAGS --info=stats2 "$DATASET_SRC/" "$ARCHIVE_ROOT/dataset/" | tail -5 \
     || die "tier 2 rsync failed"
@@ -291,7 +338,9 @@ if [ "$DRY" -eq 0 ]; then
     printf 'dataset: %s\n' "$MIRROR_RESULT"
     printf 'complete_snapshots: %s\n' "$(find "$ARCHIVE_ROOT/state" -mindepth 2 -maxdepth 2 -name .treehash 2>/dev/null | wc -l | tr -d ' ')"
     printf 'failed_snapshots: %s\n' "$(find "$ARCHIVE_ROOT/state" -mindepth 1 -maxdepth 1 -name '*.FAILED' 2>/dev/null | wc -l | tr -d ' ')"
-  } > "$ARCHIVE_ROOT/LATEST.txt"
+  } > "$ARCHIVE_ROOT/LATEST.txt.new" && mv -f "$ARCHIVE_ROOT/LATEST.txt.new" "$ARCHIVE_ROOT/LATEST.txt"
+  # written aside then moved, so a full disk cannot leave a truncated status
+  # file behind a successful run
 fi
 
 say ""
