@@ -20,7 +20,7 @@ import time
 
 sys.path.insert(0, "/home/lamp/SDLsetup")
 
-from tools import occupancy                                        # noqa: E402
+from tools import occupancy                                        # noqa: E402,I001
 from tools.environment import registers                           # noqa: E402
 from tools.environment.plc import PlcClient, PlcSettings           # noqa: E402
 

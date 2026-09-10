@@ -34,7 +34,7 @@ import time
 
 sys.path.insert(0, "/home/lamp/SDLsetup")
 
-from tools import occupancy                                  # noqa: E402
+from tools import occupancy                                  # noqa: E402,I001
 from tools.environment.plc import PlcClient, PlcSettings     # noqa: E402
 
 #: Y001, the RH solenoid discrete output. Vendor-confirmed 0-based protocol addr.
