@@ -335,6 +335,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-at-standoff", action="store_true",
                         help="end the run staged at scope_standoff, before the "
                              "final Y slide into the wells")
+    parser.add_argument("--no-grip", action="store_true",
+                        help="drive home -> tray and STOP WITH THE JAWS OPEN, "
+                             "without closing on anything. For parking the arm "
+                             "at the tray when the plate is elsewhere -- closing "
+                             "on an empty tray achieves nothing and can foul it.")
     parser.add_argument("--stop-after-grip", action="store_true",
                         help="run only home -> floor -> GRAB and stop there, with "
                              "the plate held at the tray. Nothing transits.")
@@ -380,6 +385,11 @@ def run(args: argparse.Namespace) -> int:
         print("[seq] --return-to-tray: carrying the plate back and releasing it")
     else:
         plan = build_plan(store)
+    if args.no_grip:
+        # Everything up to, but not including, the grip.
+        plan = [i for i in plan[:STEPS_BEFORE_HOLDING] if i["action"] != "grip"]
+        print("[seq] --no-grip: driving to the tray and stopping with the jaws "
+              "open; nothing will be clamped")
     if args.stop_after_grip:
         plan = plan[:STEPS_BEFORE_HOLDING]
         print("[seq] --stop-after-grip: the pick only; no transit will be attempted")
@@ -387,6 +397,10 @@ def run(args: argparse.Namespace) -> int:
         plan = [i for i in plan if i.get("name") != "microscope"]
         print("[seq] --stop-at-standoff: stopping beside the scope; the plate will "
               "NOT go under the objective")
+    if args.no_grip and (args.stop_after_grip or args.already_holding
+                         or args.slide_in or args.return_to_tray):
+        raise SystemExit("[seq] --no-grip is the approach only; it does not combine "
+                         "with flags that assume the plate is held.")
     if args.return_to_tray and (args.slide_in or args.stop_after_grip
                                 or args.already_holding or args.stop_at_standoff):
         raise SystemExit("[seq] --return-to-tray is the whole reverse route; it does "
@@ -541,6 +555,8 @@ def run(args: argparse.Namespace) -> int:
         elif args.stop_after_grip:
             print("[seq] PICK COMPLETE -- the plate is held at the tray and the arm "
                   "is stopped. Confirm by eye before the transit is run.")
+        elif args.no_grip:
+            print("[seq] AT THE TRAY, JAWS OPEN -- nothing was clamped.")
         elif args.return_to_tray:
             print("[seq] RETURNED -- the plate is back in the tray and released.")
         elif args.slide_in:

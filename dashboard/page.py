@@ -168,6 +168,20 @@ PAGE = r"""<!doctype html>
 #kinetics .cc-chart canvas{width:100%;height:150px;display:block}
 #kinetics .cc-foot{font-size:11.5px;color:var(--cc-mut);line-height:1.5;padding:2px 2px 0}
 #kinetics .cc-foot b{color:var(--cc-ink)}
+/* control card. Every row wraps -- the body must never scroll sideways. */
+#kinetics .cc-ctrl{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px}
+#kinetics .cc-grp{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+#kinetics .cc-btn{font:inherit;font-size:12px;font-weight:700;padding:5px 11px;border-radius:8px;
+  border:1px solid var(--cc-line);background:var(--cc-surf);color:var(--cc-ink);cursor:pointer}
+#kinetics .cc-btn:hover:not(:disabled){border-color:var(--cc-accent);color:var(--cc-accent)}
+#kinetics .cc-btn:disabled{color:var(--cc-off);background:#eef1f5;cursor:not-allowed}
+#kinetics .cc-btn.arm{color:#fff;background:var(--cc-amber);border-color:var(--cc-amber)}
+#kinetics .cc-in{font:inherit;font-size:12px;width:82px;padding:4px 6px;border-radius:7px;
+  border:1px solid var(--cc-line);background:var(--cc-surf);color:var(--cc-ink)}
+#kinetics .cc-cmd{font-size:11.5px;color:var(--cc-mut);line-height:1.6;margin-top:7px;word-break:break-word}
+#kinetics .cc-cmd.good{color:var(--cc-good);font-weight:600}
+#kinetics .cc-cmd.warn{color:var(--cc-amber);font-weight:600}
+#kinetics .cc-cmd.err{color:#b03a3a;font-weight:600}
 
 </style>
 </head>
@@ -236,6 +250,28 @@ PAGE = r"""<!doctype html>
       <span class="cc-title">Chamber Control</span>
       <span id="cc-pid" class="cc-pill off">PID &mdash;</span>
       <span id="cc-fresh" class="cc-fresh">&mdash;</span>
+    </div>
+    <div class="cc-card">
+      <div class="cc-sub-h">제어</div>
+      <div class="cc-ctrl">
+        <span id="cc-ctrl-run" class="cc-pill off">컨트롤러 &mdash;</span>
+        <span class="cc-grp"><span class="cc-lbl">PID</span>
+          <button id="cc-pid-on" class="cc-btn" disabled>PID ON</button>
+          <button id="cc-pid-off" class="cc-btn">PID OFF</button></span>
+        <span class="cc-grp"><span class="cc-lbl">설정값</span>
+          <input id="cc-sp-temp" class="cc-in" type="number" step="0.1" title="온도 설정값 °C"><span class="cc-sp">°C</span>
+          <input id="cc-sp-rh" class="cc-in" type="number" step="0.1" title="습도 설정값 %RH"><span class="cc-sp">%RH</span>
+          <button id="cc-sp-apply" class="cc-btn">적용</button>
+          <button id="cc-preset-paper" class="cc-btn">논문 25 / 93</button>
+          <button id="cc-preset-95" class="cc-btn">25 / 95</button></span>
+        <span class="cc-grp"><span class="cc-lbl">밸브</span>
+          <button id="cc-valve-auto" class="cc-btn" disabled>자동</button>
+          <button id="cc-valve-open" class="cc-btn" disabled>강제 개방</button>
+          <button id="cc-valve-close" class="cc-btn" disabled>강제 폐쇄</button>
+          <span id="cc-valve-note" class="cc-sp"></span></span>
+      </div>
+      <div id="cc-pending" class="cc-cmd"></div>
+      <div id="cc-cmd-msg" class="cc-cmd"></div>
     </div>
     <div class="cc-card">
       <div class="cc-tiles" id="cc-tiles"><div class="cc-tile"><div class="cc-lbl">상태</div><div class="cc-sp">상태 수신 대기 중…</div></div></div>
@@ -507,6 +543,7 @@ function onStatus(d){
   const circ = Object.values(nodes).find(n=>n.kind==="circulator");
   if(env) pushTrend(d.ts, env);
   renderChamber(env, circ);
+  renderControl(env);
   if($("kinetics").classList.contains("active")) drawTrends();
 }
 function devBar(err, span, amber){
@@ -573,6 +610,138 @@ function renderChamber(env, circ){
     }
   }
 }
+/* ---- Chamber Control: the control card ------------------------------
+   Every button POSTs to /command/environment/<name>; nothing here decides.
+   While the supervising loop holds the environment claim the node can only
+   ENQUEUE a request, so the reply is "queued as #N" and the real outcome
+   arrives in the next status poll's last_command block.
+
+   No browser dialog is used anywhere in here -- not confirm, not alert, not
+   prompt: a modal blocks the page and cannot be driven from automation. The
+   PID ON confirm is a two-click arm on the button itself.                */
+const SP_DIRTY = {temp:false, rh:false};   // never overwrite what was typed in
+const PID_ARM_MS = 5000;
+let pidArmedUntil = 0;
+let cmdLocal = null;      // {seq, text} -- what THIS browser just posted
+function ccMsg(text, cls){
+  const el=$("cc-cmd-msg"); if(!el) return;
+  el.className="cc-cmd"+(cls?" "+cls:""); el.textContent=text;
+}
+function ccDisarmPid(){
+  const b=$("cc-pid-on"); if(!b) return;
+  b.classList.remove("arm"); b.textContent="PID ON"; pidArmedUntil=0;
+}
+async function envCmd(action, body, btn){
+  if(btn) btn.disabled=true;
+  ccMsg(action+" 전송 중…","");
+  try{
+    const r=await fetch("/command/environment/"+action,
+      {method:"POST", headers:{"Content-Type":"application/json"},
+       body:JSON.stringify(body||{})});
+    const d=await r.json(); const res=d.result||{};
+    if(res.queued===true){
+      // Accepted, not applied. The outcome line below replaces this as soon as
+      // the controller publishes a last_command with this seq or newer.
+      cmdLocal={seq:res.seq, text:"#"+res.seq+" "+action+" → queued"};
+      ccMsg(cmdLocal.text,"");
+    }else if(res.refused){ cmdLocal=null; ccMsg(action+" 거부: "+res.refused,"warn"); }
+    else if(res.ok===true){ cmdLocal=null; ccMsg(action+" → "+(res.outcome||"ok"),"good"); }
+    else { cmdLocal=null; ccMsg(action+" 실패: "+(res.error||d.error||"unknown"),"err"); }
+  }catch(e){ cmdLocal=null; ccMsg(action+" 전송 실패","err"); }
+  finally{ if(btn) btn.disabled=false; pollStatus(); }
+}
+function renderControl(env){
+  const run=$("cc-ctrl-run"); if(!run) return;
+  const ctl=(env && env.controller) ? env.controller : null;
+  const running=!!(env && env.controller_running);
+  // The pill reads controller_running -- the same occupancy claim command()
+  // branches on -- so a button disabled here really would have been refused.
+  if(running){
+    run.className="cc-pill on";
+    run.textContent="컨트롤러 실행 중"+((ctl && ctl.pid) ? " · pid "+ctl.pid : "");
+    run.title=(ctl && ctl.run_dir) ? ctl.run_dir : "";
+  }else{
+    run.className="cc-pill off";
+    run.textContent="컨트롤러 없음 — start_kinetics --execute 필요";
+    run.title="";
+  }
+  const onBtn=$("cc-pid-on");
+  if(onBtn){
+    onBtn.disabled=!running;
+    onBtn.title=running ? "실행 중인 감시 루프에 PID ON 요청"
+      : "컨트롤러 없음: 감시 루프 없이 ladder PID를 켜면 수조가 무명령 상태로 남습니다";
+    if(!running) ccDisarmPid();
+  }
+  // The inputs follow the published setpoints until the operator touches them.
+  const t=$("cc-sp-temp"), h=$("cc-sp-rh");
+  const num=(v)=>(typeof v==="number" && isFinite(v)) ? v.toFixed(1) : "";
+  if(t && !SP_DIRTY.temp) t.value=num(env ? env.temp_sp_c : null);
+  if(h && !SP_DIRTY.rh)   h.value=num(env ? env.rh_sp_pct : null);
+  // Valve: only the controller knows whether it can be forced, and today it
+  // reports "unavailable" with a reason. Show the reason, do not guess.
+  const mode=ctl ? ctl.valve_mode : null;
+  const usable=!!(running && mode && mode!=="unavailable");
+  const note=(ctl && ctl.valve_note) ? ctl.valve_note
+    : (running ? "컨트롤러가 밸브 모드를 보고하지 않습니다" : "컨트롤러 없음");
+  ["auto","open","close"].forEach(m=>{
+    const b=$("cc-valve-"+m); if(!b) return;
+    b.disabled=!usable; b.title=usable ? ("밸브 모드 "+m+" 요청") : note;
+  });
+  const vn=$("cc-valve-note");
+  if(vn) vn.textContent=usable ? ("현재 "+mode) : note;
+  // Outcome line. A published last_command whose seq caught up with what this
+  // browser posted replaces the local "queued" text; an older one does not.
+  const lc=(env && env.last_command) ? env.last_command : null;
+  if(lc && (!cmdLocal || (typeof lc.seq==="number" && lc.seq>=cmdLocal.seq))){
+    cmdLocal=null;
+    const cls=(lc.outcome==="confirmed") ? "good"
+      : (lc.outcome==="failed") ? "err"
+      : (lc.outcome==="refused" || lc.outcome==="stale") ? "warn" : "";
+    ccMsg("#"+lc.seq+" "+lc.name+" → "+lc.outcome+(lc.detail ? ": "+lc.detail : ""), cls);
+  }
+  const pend=$("cc-pending");
+  if(pend){
+    const pc=(env && env.pending_command) ? env.pending_command : null;
+    if(!pc){ pend.className="cc-cmd"; pend.textContent=""; }
+    else if(pc.error){ pend.className="cc-cmd err"; pend.textContent="대기 명령 판독 불가: "+pc.error; }
+    else { pend.className="cc-cmd warn";
+           pend.textContent="대기 중 · seq "+pc.seq+" · "+knum(pc.age_s,0)+"s"; }
+  }
+}
+function ccPreset(temp, rh){
+  $("cc-sp-temp").value=temp.toFixed(1); $("cc-sp-rh").value=rh.toFixed(1);
+  // Filled on purpose, so status must not overwrite it -- and a preset SENDS
+  // nothing; 적용 is still the only thing that posts.
+  SP_DIRTY.temp=true; SP_DIRTY.rh=true;
+  ccMsg("프리셋 입력됨 — 적용을 눌러야 전송됩니다","");
+}
+["temp","rh"].forEach(k=>{
+  const el=$(k==="temp" ? "cc-sp-temp" : "cc-sp-rh");
+  if(el) el.addEventListener("input", ()=>{SP_DIRTY[k]=true;});
+});
+$("cc-pid-on").onclick=e=>{
+  const b=e.currentTarget;
+  if(Date.now()<=pidArmedUntil){ ccDisarmPid(); envCmd("enable_pid",{},b); return; }
+  pidArmedUntil=Date.now()+PID_ARM_MS;
+  b.classList.add("arm"); b.textContent="정말 켤까요? (다시 클릭)";
+  setTimeout(()=>{ if(Date.now()>pidArmedUntil) ccDisarmPid(); }, PID_ARM_MS+50);
+};
+$("cc-pid-off").onclick=e=>envCmd("disable_pid",{},e.currentTarget);
+$("cc-sp-apply").onclick=e=>{
+  const body={};
+  const t=parseFloat($("cc-sp-temp").value), h=parseFloat($("cc-sp-rh").value);
+  if(SP_DIRTY.temp && isFinite(t)) body.temp_c=t;
+  if(SP_DIRTY.rh && isFinite(h)) body.rh_pct=h;
+  if(!("temp_c" in body) && !("rh_pct" in body)){ ccMsg("바뀐 설정값이 없습니다","warn"); return; }
+  SP_DIRTY.temp=false; SP_DIRTY.rh=false;
+  envCmd("set_setpoint", body, e.currentTarget);
+};
+$("cc-preset-paper").onclick=()=>ccPreset(25,93);
+$("cc-preset-95").onclick=()=>ccPreset(25,95);
+["auto","open","close"].forEach(m=>{
+  const b=$("cc-valve-"+m); if(b) b.onclick=e=>envCmd("valve",{mode:m},e.currentTarget);
+});
+
 function drawLineChart(cv, series, unit){
   const ctx = cv.getContext("2d"); if(!ctx) return;
   const dpr = window.devicePixelRatio || 1;

@@ -45,6 +45,30 @@ EXECUTE IS TRIPLE-GATED
   `circulator.allow_actuation` to be true. If either is shut, this REFUSES,
   names the shut gate, and returns without touching hardware -- it never silently
   degrades to a dry run.
+
+A LIVE RUN TAKES DASHBOARD COMMANDS MID-RUN
+  A live run is not a closed box for its whole duration. The loop it delegates
+  to reads one pending command per period out of
+  `tools.environment.channel` and applies it through the same guards a CLI flag
+  would: a new temperature or humidity setpoint (bounded, rate-limited, written
+  as one FC16 and read back), and the PLC's PID loop on or off. Manual valve
+  control is refused -- Y001's coil address is unverified. A command older than
+  `channel.STALE_AFTER_S` when the loop reaches it is reported stale and never
+  applied, so an intent queued before a restart does not fire after one.
+
+  Every iteration also publishes the reading the loop just acted on, plus which
+  process is holding the chamber and what became of the last command, where the
+  dashboard reads it. Nothing about this changes the one-call API: it is the
+  same `start_kinetics(...)` and the same `hold_environment` loop underneath.
+
+THE RUN IS STOPPABLE, AND STOPPING IT IS FAIL-SAFE
+  `SIGINT` and `SIGTERM` both end a live run through its fail-safe: the safe
+  bath setpoint is written and the PLC's C1 (PID Auto) is driven False before
+  the process exits. `kill -TERM <pid>` on a supervised run is therefore the
+  supported way to stop one, and Ctrl-C does the same thing interactively. See
+  `_install_operator_stop_handlers` in `hold_environment.py` for why this needs
+  saying: a background job inherits SIGINT ignored, and the default SIGTERM
+  disposition would skip the fail-safe entirely.
 """
 from __future__ import annotations
 

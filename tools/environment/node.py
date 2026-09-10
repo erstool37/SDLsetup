@@ -36,28 +36,41 @@ The occupancy check is what makes the first knob safe to turn on: the PLC's
 self-conflict entry exists precisely to protect the three-client limit, so a
 dashboard that respects it cannot steal a run's socket.
 
+Two paths, and this node does not choose between them
+=====================================================
+
+The occupancy claim does. While the supervising loop
+(``scripts/environment/start_kinetics.py --execute``) holds ``environment``,
+this process cannot open a session at all -- so a command is *asked for*
+instead of performed: :func:`~.channel.enqueue` leaves one pending request in
+``command.json``, the loop applies it through the same guards a CLI flag would,
+and reports the outcome in the ``last_command`` block :meth:`status` surfaces.
+With no loop running, the existing direct paths are used unchanged.
+
+So a reply of ``{"queued": True}`` promises that the request was *accepted*,
+never that the chamber changed. Those are different facts and they are
+different keys.
+
 .. warning::
 
-   **``enable_pid`` is deliberately NOT a dashboard command, and must not be
-   added.**
+   **``enable_pid`` is never a direct write from here.** Enabling the ladder PID
+   hands the chamber's heater and humidifier to the loop, so it is offered only
+   as a request to a loop that is *already running and watching* -- which is the
+   thing that makes it supervised. With no controller running it stays refused:
+   an enabled PID with nothing driving the bath leaves the chamber uncommanded.
 
-   Enabling the ladder PID hands control of the chamber's heater and humidifier
-   to the loop. That is an actuation, and the standing rule on this lab surface
-   is that anything which can physically actuate hardware is confirmed
-   deliberately -- not clicked on a status page. ``allow_actuation`` gating is
-   not sufficient mitigation; the circulator's ``open`` was dropped from its own
-   dashboard surface for exactly this reason.
-
-   ``disable_pid`` **stays**. Turning the loop off is the safe direction, it is
+   ``disable_pid`` is available on both paths. Off is the safe direction, it is
    what an abort does, and an operator watching a chamber misbehave needs it
    reachable without finding a terminal.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .. import occupancy
 from ..node import Node
+from .channel import ChannelError, enqueue, peek
 from .plc import PlcClient, PlcSettings, latest_published
 from .safety import ActuationNotAllowed, PlcError, SafetyError
 
@@ -165,6 +178,11 @@ class EnvironmentNode(Node):
         rh_pid_output_pct = channels.get("rh_pid_output_pct")
         age_s = (published or {}).get("age_s")
         pid = (published or {}).get("pid_enabled")
+        # The two blocks tools.environment.channel defines. Absent means no loop
+        # has published since this file was last written -- reported as None,
+        # which is not the same as False.
+        controller = (published or {}).get("controller")
+        last_command = (published or {}).get("last_command")
 
         if published is None:
             self.state = "offline"
@@ -197,6 +215,13 @@ class EnvironmentNode(Node):
                                 "note": "unset -> in_range is None. TODO(operator): "
                                         "declare this chamber's in-range tolerances"},
             pid_enabled=pid,
+            # The claim, not the published block, answers "is a loop running":
+            # it is the same fact command() branches on, so a button this page
+            # disables really would have been refused.
+            controller_running=bool(holders),
+            controller=controller if isinstance(controller, dict) else None,
+            last_command=last_command if isinstance(last_command, dict) else None,
+            pending_command=self._pending_command(),
             age_s=age_s,
             stale_after_s=settings.plc_stale_s,
             clients_limit_reached=diag["clients_limit_reached"],
@@ -205,6 +230,22 @@ class EnvironmentNode(Node):
             error=publish_error,
             last_event=self._last,
         )
+
+    def _pending_command(self) -> dict | None:
+        """The one unconsumed request, read and never consumed.
+
+        A malformed ``command.json`` is reported in place rather than raised: the
+        rest of the card is still true, and the page needs to say *why* nothing
+        is being applied.
+        """
+        try:
+            cmd = peek()
+        except ChannelError as exc:
+            return {"error": str(exc)}
+        if cmd is None:
+            return None
+        return {"seq": cmd.seq, "name": cmd.name, "args": cmd.args,
+                "age_s": round(max(0.0, time.time() - cmd.issued_unix_s), 1)}
 
     def _transient_read(self, published: dict | None):
         """One connect -> read -> publish -> close. Returns ``(published, polled, error)``."""
@@ -262,35 +303,61 @@ class EnvironmentNode(Node):
         return all(verdicts)
 
     # -- commands ---------------------------------------------------------
+    #: The channel's key for each PLC setpoint field. One table, so the queued
+    #: path and the direct path cannot drift on which register a request means.
+    _SETPOINT_FIELDS = {"temp_c": "temp_sp_c", "rh_pct": "rh_sp_pct"}
+
     def commands(self) -> list[str]:
-        """The dashboard surface. NO ``enable_pid`` -- see the class docstring."""
-        return ["status", "read", "set_temperature", "set_humidity", "disable_pid"]
+        """The dashboard surface. ``enable_pid`` and ``valve`` exist only as
+        requests to a running controller -- see the class docstring."""
+        return ["status", "read", "set_setpoint", "set_temperature",
+                "set_humidity", "enable_pid", "disable_pid", "valve"]
 
     def command(self, name: str, **kwargs: Any) -> dict:
         try:
+            # Read the claim ONCE. It decides between asking the loop and writing
+            # directly, and a second read mid-command could answer differently --
+            # which would be two paths for one operator click.
+            running = bool(occupancy.blockers("environment"))
             if name == "status":
                 return self.status()
             if name == "read":
                 return self._record("read", self._read_once())
+            if name == "set_setpoint":
+                given = {key: kwargs[key] for key in self._SETPOINT_FIELDS
+                         if kwargs.get(key) is not None}
+                if not given:
+                    raise SafetyError("set_setpoint needs temp_c and/or rh_pct; "
+                                      "refusing to guess one")
+                return self._setpoint(name, running, given)
             if name == "set_temperature":
-                return self._record("set_temperature",
-                                    self._write("temp_sp_c", kwargs.get("target_c")))
+                return self._setpoint(name, running, {"temp_c": kwargs.get("target_c")})
             if name == "set_humidity":
-                return self._record("set_humidity",
-                                    self._write("rh_sp_pct", kwargs.get("target_pct")))
+                return self._setpoint(name, running, {"rh_pct": kwargs.get("target_pct")})
             if name == "disable_pid":
                 # Always allowed: off is the safe direction, and a supervisor
-                # that may not write must still be one that can stop.
+                # that may not write must still be one that can stop. Running,
+                # the loop holds the only session, so it is the thing that turns
+                # the PID off -- and the thing that confirms it.
+                if running:
+                    return self._queue(name, "pid", {"enabled": False})
                 return self._record("disable_pid", self._set_pid(False))
             if name == "enable_pid":
+                if running:
+                    return self._queue(name, "pid", {"enabled": True})
                 return {"action": name, "ok": False, "refused":
-                        "enable_pid is not a dashboard command and will not be "
-                        "added: enabling the ladder PID hands the chamber's "
-                        "heater and humidifier to the loop, which is an "
-                        "actuation that must be made deliberately from a script. "
-                        "disable_pid is available, because off is the safe "
-                        "direction."}
-        except (ActuationNotAllowed, SafetyError, occupancy.Busy) as exc:
+                        "no controller is running; enabling the ladder PID "
+                        "without the supervising loop leaves the bath "
+                        "uncommanded -- start `scripts/environment/"
+                        "start_kinetics.py --execute` first."}
+            if name == "valve":
+                if running:
+                    return self._queue(name, "valve", {"mode": kwargs.get("mode")})
+                return {"action": name, "ok": False, "refused":
+                        "no controller is running; the valve mode belongs to the "
+                        "supervising loop -- start `scripts/environment/"
+                        "start_kinetics.py --execute` first."}
+        except (ActuationNotAllowed, SafetyError, occupancy.Busy, ChannelError) as exc:
             self.log("%s refused: %s" % (name, exc), "warn")
             return {"action": name, "ok": False, "refused": str(exc)}
         except Exception as exc:  # report on the bus, never raise into it
@@ -298,6 +365,39 @@ class EnvironmentNode(Node):
             return {"action": name, "ok": False, "error": str(exc)}
         return {"action": name, "ok": False,
                 "error": "no such environment command: %r" % name}
+
+    def _setpoint(self, action: str, running: bool, targets: dict) -> dict:
+        """One setpoint change, by whichever path is open.
+
+        Running, both keys travel as ONE ``setpoint`` command: they are a single
+        operator intent, and splitting them would let the loop apply half of it
+        and refuse the rest. Not running, each key takes the existing direct
+        path -- bounds first, then a transient claim.
+        """
+        if running:
+            return self._queue(action, "setpoint", targets)
+        results = {field: self._write(field, targets[key])
+                   for key, field in self._SETPOINT_FIELDS.items()
+                   if key in targets}
+        if len(results) == 1:
+            return self._record(action, next(iter(results.values())))
+        return self._record_writes(action, results)
+
+    def _queue(self, action: str, name: str, args: dict) -> dict:
+        """Hand one request to the running controller. Applies nothing.
+
+        The loop runs it through the same guards a CLI flag would and reports the
+        result in ``last_command``, so ``queued`` is a separate key from ``ok``:
+        accepted and applied are different facts.
+        """
+        cmd = enqueue(name, args)
+        out = {"action": action, "ok": True, "queued": True, "seq": cmd.seq,
+               "note": "the controller applies it through the same guards; "
+                       "watch last_command"}
+        self._last = out
+        self.log("%s queued as seq %d: %s %r" % (action, cmd.seq, name, cmd.args))
+        self.publish_status()
+        return out
 
     def _read_once(self) -> dict:
         """One claimed, transient read, published for whoever renders next."""
@@ -366,6 +466,28 @@ class EnvironmentNode(Node):
                     "error": payload.error, "field": payload.field,
                     "value": payload.value, "describe": payload.describe()}
         return payload
+
+    def _record_writes(self, action: str, results: dict) -> dict:
+        """The multi-field sibling of :meth:`_record`.
+
+        One POST gets one response, so every WriteResult travels in one envelope
+        keyed by field. A single merged ``outcome`` would hide the case that
+        matters: the temperature written and the humidity only planned.
+        """
+        out: dict = {"action": action, "ok": True, "results": {}}
+        notes = []
+        for field, payload in results.items():
+            result = self._as_dict(payload)
+            outcome = result.get("outcome") if isinstance(result, dict) else None
+            if outcome == "failed":
+                out["ok"] = False
+            out["results"][field] = result
+            notes.append("%s %s" % (field, outcome or "ok"))
+        self._last = out
+        self.log("%s: %s" % (action, "; ".join(notes)),
+                 "info" if out["ok"] else "warn")
+        self.publish_status()
+        return out
 
     def _record(self, action: str, payload: Any) -> dict:
         result = self._as_dict(payload)

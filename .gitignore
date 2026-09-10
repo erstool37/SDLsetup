@@ -86,3 +86,8 @@ models/
 *.tar
 *.tar.gz
 *.7z
+
+# Ad-hoc pre-change snapshots. Archived to the Windows archive, not git.
+# See .claude/rules/data-retention.md on the Server control surface.
+configs/*.bak.*
+.backup-*/

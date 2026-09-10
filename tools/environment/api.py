@@ -90,6 +90,36 @@ from typing import Any
 #: confused with the PLC's. See the module docstring -- they are unrelated
 #: classes with different bases, and catching one does not catch the other.
 from ..circulator.api import SafetyError as CirculatorSafetyError
+
+#: The dashboard<->controller command channel. The MODULE is re-exported, not
+#: just its names: ``enqueue``/``peek``/``take`` are re-exported below too, but
+#: ``env.channel.take()`` is what an orchestration line should read like, and
+#: ``channel.validate`` is reachable only that way -- it appears here as
+#: :func:`validate_command`, because a bare ``validate`` on this surface would
+#: be read as ``SetpointLimits.validate``, which is a different guard on a
+#: different thing.
+from . import channel
+from .channel import (
+    COMMAND_NAME,
+    COMMAND_NAMES,
+    OUTCOME_CONFIRMED,
+    OUTCOME_FAILED,
+    OUTCOME_PLANNED,
+    OUTCOME_REFUSED,
+    OUTCOME_STALE,
+    OUTCOMES,
+    STALE_AFTER_S,
+    VALVE_MODES,
+    ChannelError,
+    Command,
+    channel_dir,
+    enqueue,
+    is_stale,
+    outcome_record,
+    peek,
+    take,
+)
+from .channel import validate as validate_command
 from .node import EnvironmentNode
 from .plc import (
     CONFIRMED,
@@ -319,6 +349,8 @@ __all__ = [
     "BLOCK_COUNT",
     "BY_FIELD",
     "C1_COIL",
+    "COMMAND_NAME",
+    "COMMAND_NAMES",
     "CONFIG_SECTION",
     "CONFIRMED",
     "COOPERATIVE_WATCHDOG_RESIDUAL",
@@ -330,11 +362,21 @@ __all__ = [
     "REGISTERS",
     "UNKNOWN_DF",
     "WRITABLE",
+    "OUTCOMES",
+    "OUTCOME_CONFIRMED",
+    "OUTCOME_FAILED",
+    "OUTCOME_PLANNED",
+    "OUTCOME_REFUSED",
+    "OUTCOME_STALE",
+    "STALE_AFTER_S",
+    "VALVE_MODES",
     "ActuationNotAllowed",
     "BoundedSetpoint",
+    "ChannelError",
     "ChannelQuality",
     "CirculatorSafetyError",
     "CoilSpec",
+    "Command",
     "CommsLost",
     "Environment",
     "EnvironmentNode",
@@ -354,13 +396,19 @@ __all__ = [
     "SafetyError",
     "SetpointLimits",
     "WriteResult",
+    "channel",
+    "channel_dir",
     "decode_block",
     "df_address",
     "diagnostics",
     "disable_pid",
     "enable_pid",
+    "enqueue",
     "f32_to_regs",
+    "is_stale",
     "latest_published",
+    "outcome_record",
+    "peek",
     "pid_enabled",
     "provenance",
     "provenance_table",
@@ -369,4 +417,6 @@ __all__ = [
     "regs_to_f32",
     "set_humidity",
     "set_temperature",
+    "take",
+    "validate_command",
 ]

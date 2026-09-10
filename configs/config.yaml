@@ -217,7 +217,7 @@ environment:
   # The CLICK accepts at most 3 concurrent Modbus TCP clients and refuses a 4th,
   # so the dashboard must NOT hold a session of its own while a run is going.
   # It renders the state the run publishes instead of polling the PLC.
-  dashboard_poll_plc: false
+  dashboard_poll_plc: true
 
 circulator:
   # Custom MCU board on Modbus RTU over a serial line. It is the temperature

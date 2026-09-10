@@ -13,21 +13,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO))
+import no_hardware  # MUST be first: it blocks every real transport
 
-from scripts.environment.check_environment import check_environment  # noqa: E402
-from scripts.environment.start_kinetics import start_kinetics  # noqa: E402
-from tools.circulator.api import (  # noqa: E402
+from scripts.environment.check_environment import check_environment
+from scripts.environment.start_kinetics import start_kinetics
+from tools.circulator.api import (
     Circulator,
     CirculatorSettings,
     FakeSerial,
-    decode_setpoint,  # noqa: E402
+    decode_setpoint,
 )
-from tools.environment import registers  # noqa: E402
-from tools.environment.plc import FakePlc, PlcClient, PlcSettings  # noqa: E402
-from tools.environment.relay import Relay, RelayPolicy  # noqa: E402
-from tools.environment.safety import CommsLost, FailSafeIncomplete, SafetyError  # noqa: E402
+from tools.environment import registers
+from tools.environment.plc import FakePlc, PlcClient, PlcSettings
+from tools.environment.relay import Relay, RelayPolicy
+from tools.environment.safety import CommsLost, FailSafeIncomplete, SafetyError
 
 fails = 0
 
@@ -45,6 +44,41 @@ ROW = {1: 95.0, 2: 25.0, 5: 25.0, 6: 95.0, 9: 24.774, 10: 25.340,
        18: 24.866, 19: 95.180}
 SAFE_C = 15.0
 DF9 = registers.df_address(9)
+
+#: Gate states this file STATES, rather than reading out of the shipped
+#: configs/config.yaml. That file is an operator surface: on 2026-09-09 it
+#: carried allow_actuation: true in both sections for a supervised run, and the
+#: refusal case below -- which had asserted "execute=True is refused while the
+#: gates are shut" against whatever the file happened to say -- found them OPEN
+#: and delegated a LIVE run to hold_environment against the real PLC. A test
+#: asserting a refusal must supply the condition it is asserting about.
+BATH_KEYS = {"safe_setpoint_c": SAFE_C, "port": "/tmp/sdl-fake-circulator",
+             "boot_settle_s": 0.0}
+GATES_SHUT = {"environment": {"allow_actuation": False},
+              "circulator": dict(BATH_KEYS, allow_actuation=False)}
+PLC_GATE_SHUT = {"environment": {"allow_actuation": False},
+                 "circulator": dict(BATH_KEYS, allow_actuation=True)}
+BATH_GATE_SHUT = {"environment": {"allow_actuation": True},
+                  "circulator": dict(BATH_KEYS, allow_actuation=False)}
+#: The gate-open case has to be a config FILE, not a dict: start_kinetics's
+#: execute path hands `--config str(cfg)` to hold_environment's argv, so a dict
+#: arrives there as its own repr and is refused as an unreadable config -- the
+#: run would never reach a transport, and the regression test below would pass
+#: for the wrong reason. Written into the throwaway tree, with data.root pointed
+#: there too (data.root outranks SDL_DATA_ROOT).
+GATES_OPEN = no_hardware.TMP / "gates-open.yaml"
+GATES_OPEN.write_text(
+    "data:\n"
+    "  root: %s\n"
+    "environment:\n"
+    "  allow_actuation: true\n"
+    "  relay_period_s: 0.02\n"
+    "circulator:\n"
+    "  allow_actuation: true\n"
+    "  safe_setpoint_c: %g\n"
+    "  port: /tmp/sdl-fake-circulator\n"
+    "  boot_settle_s: 0.0\n" % (no_hardware.DATA_ROOT, SAFE_C),
+    encoding="utf-8")
 
 
 class Clock:
@@ -71,6 +105,19 @@ def poke(fake: FakePlc, df: int, value: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+print("\n--- the hardware tripwire is armed BEFORE anything else runs ---")
+# Asked first and asserted, not assumed: this file reaches start_kinetics's
+# execute path, and if the tripwire has stopped working the rest of the file
+# talks to the PLC. A guard that cannot fail has not guarded anything.
+try:
+    no_hardware.selftest()
+    ok(True, "no_hardware blocks a real Modbus client and a raw TCP socket",
+       no_hardware.describe())
+except AssertionError as exc:
+    ok(False, "TRIPWIRE IS NOT ARMED -- stopping", str(exc))
+    sys.exit(1)
+
+
 print("\n--- an out-of-range setpoint is REFUSED through the guarded path (dry run) ---")
 for bad_temp in (99.0, 30.0, 0.0, -1.0):
     try:
@@ -105,14 +152,44 @@ ok(any("DRY RUN" in n for n in summary["notes"]),
    "the notes record that nothing was written")
 
 
-print("\n--- execute=True is REFUSED while the config gates are shut ---")
-# The shipped config has both allow_actuation false, so this is the real path.
-summary = start_kinetics(temp_c=25.0, execute=True, _client=fake_client())
-ok(summary["executed"] is False, "not executed with a gate shut")
-ok(summary["run_dir"] is None, "no run was created -- refused before any I/O")
-ok("refused" in summary["ended"], "ended names the refusal", summary["ended"])
-ok(any("allow_actuation" in n for n in summary["notes"]),
-   "the refusal names the shut gate")
+print("\n--- execute=True is REFUSED while a config gate is shut ---")
+# Each case STATES its gates. See GATES_SHUT for why that is not a detail.
+for label, cfg, expect in (
+        ("both gates shut", GATES_SHUT, ("environment", "circulator")),
+        ("only the PLC gate shut", PLC_GATE_SHUT, ("environment",)),
+        ("only the bath gate shut", BATH_GATE_SHUT, ("circulator",))):
+    summary = start_kinetics(temp_c=25.0, execute=True, config=cfg,
+                             _client=fake_client())
+    ok(summary["executed"] is False, "%s: not executed" % label)
+    ok(summary["run_dir"] is None,
+       "%s: no run was created -- refused before any I/O" % label)
+    ok("refused" in summary["ended"], "%s: ended names the refusal" % label,
+       summary["ended"])
+    named = " ".join(summary["notes"])
+    ok(all(("%s.allow_actuation" % section) in named for section in expect),
+       "%s: the refusal names exactly which gate(s)" % label,
+       ", ".join(expect))
+
+
+print("\n--- and with BOTH gates open, the tripwire stops it reaching hardware ---")
+# The regression test for the 2026-09-09 incident. With the gates open,
+# start_kinetics delegates to hold_environment.run(args) -- which takes no
+# transport seam through this path, so it builds a REAL Modbus client. That must
+# be impossible from a test regardless of what any config says, and it must be
+# LOUD: HardwareTripwire is a BaseException precisely because every I/O boundary
+# in this tree swallows Exception and would have turned this into a quiet
+# "connect failed" while the next call reached the PLC.
+try:
+    start_kinetics(temp_c=25.0, rh_pct=93.0, hours=0.001, execute=True,
+                   config=str(GATES_OPEN))
+    ok(False, "a gate-open execute run was NOT stopped -- it reached its "
+              "transport. STOP: this suite can touch the PLC.")
+except no_hardware.HardwareTripwire as exc:
+    ok(True, "a gate-open execute run is stopped at the transport, not at the "
+             "gate", str(exc)[:70])
+except BaseException as exc:  # noqa: BLE001
+    ok(False, "a gate-open execute run failed for the WRONG reason",
+       "%s: %s" % (type(exc).__name__, exc))
 
 
 print("\n--- check_environment returns a zero-actuation status read ---")

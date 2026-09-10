@@ -53,7 +53,16 @@ Y_STANDOFF_MM = 150.0          # scope_standoff = A1 + (0, -Y_STANDOFF, 0)
 #: decisions/2026-08-11-bio-gripper-position-mode.md. Unlike "microscope",
 #: teaching it recomputes NOTHING: there is no derived standoff for it yet, and
 #: inventing one before the approach is surveyed would be a guess.
-TEACHABLE = ("microscope", "floor", "home", "uvvis")
+#: "floor2" is a SECOND grip point on the tray, on the BACK part of the plate
+#: (operator, 2026-08-13). It exists because the plate must sit differently in
+#: the jaws to fit the UV-Vis carrier: where you grip the plate decides how far
+#: it protrudes, and the first grip point does not clear that tray. "uvvis2" is
+#: its counterpart at the reader -- the place the arm delivers to when carrying
+#: from floor2.
+#:
+#: floor and floor2 are NOT interchangeable. A route that picks at one and
+#: places at the other's destination carries the plate at the wrong offset.
+TEACHABLE = ("microscope", "floor", "floor2", "home", "uvvis", "uvvis2")
 
 
 def build_parser() -> argparse.ArgumentParser:

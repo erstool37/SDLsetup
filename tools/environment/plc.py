@@ -177,17 +177,43 @@ def _publish_path() -> Path:
     return PUBLISH_DIR / PUBLISH_NAME
 
 
-def publish_last_reading(record: _reading.EnvironmentReading) -> Path:
+#: Keys :func:`publish_last_reading` will not let ``extra`` supply. The first
+#: three are stamped by that function; ``age_s`` is computed by
+#: :func:`latest_published` on read, and a stored one would let a stale file
+#: claim to be fresh.
+_PUBLISH_RESERVED = ("published_unix_s", "published_monotonic_s", "age_s")
+
+
+def publish_last_reading(record: _reading.EnvironmentReading, *,
+                         extra: dict[str, Any] | None = None) -> Path:
     """Write ``record`` to :data:`PUBLISH_DIR` atomically; return the path.
 
     The dashboard reads this instead of opening its own Modbus session, because
     the CLICK only has :data:`MAX_CONCURRENT_CLIENTS` sockets to spend. Written
     to a temp file in the same directory and moved with :func:`os.replace`, so
     a reader never sees a half-written record.
+
+    ``extra`` merges further top-level blocks into the payload -- the live loop's
+    ``controller`` and ``last_command`` (the contract is in
+    :mod:`tools.environment.channel`). It may not shadow a key the reading
+    itself decoded, nor the ``published_*``/``age_s`` stamps: a caller-supplied
+    ``channels`` or ``read_ok`` would be indistinguishable in the file from a
+    measured one, which is the one thing the dashboard has to be able to trust.
+    Refused, never merged with the reading winning silently.
     """
     path = _publish_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = record.as_dict()
+    reserved = set(payload) | set(_PUBLISH_RESERVED)
+    for key, value in (extra or {}).items():
+        if key in reserved:
+            raise SafetyError(
+                "publish_last_reading(extra=...): %r belongs to the reading "
+                "record and may not be supplied by a caller -- a published %r "
+                "that this module did not decode cannot be told apart from one "
+                "it did. Reserved: %s"
+                % (key, key, sorted(reserved)))
+        payload[key] = value
     payload["published_unix_s"] = time.time()
     payload["published_monotonic_s"] = time.monotonic()
     temp = path.with_name(path.name + ".%d.tmp" % os.getpid())
@@ -940,9 +966,10 @@ class PlcClient:
             "native_diagnostics": native,
         }
 
-    def publish_last_reading(self, record: _reading.EnvironmentReading) -> Path:
+    def publish_last_reading(self, record: _reading.EnvironmentReading, *,
+                             extra: dict[str, Any] | None = None) -> Path:
         """Publish ``record`` for the dashboard. See :func:`publish_last_reading`."""
-        return publish_last_reading(record)
+        return publish_last_reading(record, extra=extra)
 
     @staticmethod
     def latest_published() -> dict[str, Any] | None:

@@ -71,7 +71,10 @@ FIRST ADOPTER OF tools.runs.Run
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -86,6 +89,29 @@ from tools import occupancy, runs  # noqa: E402
 DEVICE = "environment"
 BATH = "circulator"
 PHASE = "hold_environment"
+
+#: Manual valve control is NOT wired, and the dashboard is told exactly that
+#: rather than shown a switch that does nothing. Y001's Modbus coil address is
+#: unverified, and so is the ladder gating that would have to honour it -- an
+#: invented coil address writes some other output. So every `valve` command is
+#: REFUSED, carrying this text as its reason. A later investigation may
+#: establish the address; these are a module constant so that is a one-line
+#: change here rather than a search through the loop.
+VALVE_MODE = "unavailable"
+VALVE_NOTE = ("Y001 coil address and ladder gating unverified; manual valve "
+              "control is not wired")
+
+#: The one mapping from a dashboard setpoint key to the CLI flag it mirrors, the
+#: field the bound is keyed on, the `args` attribute that flag lands in, and the
+#: guarded writer. `_write_setpoints` (the --temp-sp/--rh-sp path) and
+#: `_apply_setpoint` (the dashboard path) both iterate THIS, so the two cannot
+#: drift apart on which field, which bound, or which writer -- there is one
+#: setpoint write path in this file and it is `env.set_temperature` /
+#: `env.set_humidity`, whichever asked for it.
+SETPOINT_WRITERS = (
+    ("temp_c", "--temp-sp", "temp_sp_c", "temp_sp", env.set_temperature),
+    ("rh_pct", "--rh-sp", "rh_sp_pct", "rh_sp", env.set_humidity),
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -193,20 +219,28 @@ def _check_safe_setpoint(policy: env.RelayPolicy,
 
 
 def _write_setpoints(args: argparse.Namespace, client: env.PlcClient,
-                     record_run: runs.Run, live: bool) -> bool:
+                     record_run: runs.Run, live: bool,
+                     history: dict[str, tuple[float, float]]) -> bool:
     """Write DF5/DF6 once, if asked. Returns False if a write was not confirmed.
 
     Branches on ``outcome``, never on ``ok``: ``ok`` is False for a perfectly
     successful dry run, so ``if not result.ok`` would read every plan as a
     failure.
+
+    A CONFIRMED write is recorded in ``history``, which is the rate limiter's
+    memory. That matters because the dashboard can change a setpoint seconds
+    later: without seeding it here, the interval rule would treat the first
+    dashboard command of a run as "no previous write" and let it land on top of
+    the one this function just made.
     """
     all_good = True
-    for flag, field, setter, value in (
-            ("--temp-sp", "temp_sp_c", env.set_temperature, args.temp_sp),
-            ("--rh-sp", "rh_sp_pct", env.set_humidity, args.rh_sp)):
+    for _key, flag, field, attr, setter in SETPOINT_WRITERS:
+        value = getattr(args, attr)
         if value is None:
             continue
         result = setter(value, args.config, client=client, dry_run=not live)
+        if result.outcome == env.CONFIRMED:
+            history[field] = (float(value), time.time())
         record_run.record(DEVICE, "setpoint_writes", result.as_dict())
         record_run.log("%s %s: %s" % (flag, field, result.describe()),
                        device=DEVICE)
@@ -223,6 +257,310 @@ def _write_setpoints(args: argparse.Namespace, client: env.PlcClient,
     return all_good
 
 
+def _stop_on_signal(signum: int, _frame: object) -> None:
+    """Turn a signal into the KeyboardInterrupt this file already handles."""
+    raise KeyboardInterrupt("stopped by signal %d" % signum)
+
+
+def _install_operator_stop_handlers() -> dict:
+    """Wire SIGINT and SIGTERM to the loop's existing KeyboardInterrupt path.
+
+    Returns the previous dispositions; hand them to
+    :func:`_restore_stop_handlers` in the same ``finally`` that runs the
+    fail-safe.
+
+    WHY THIS IS NOT REDUNDANT WITH WHAT CPython ALREADY DOES. A process started
+    as a background job from a NON-INTERACTIVE bash inherits SIGINT set to
+    ``SIG_IGN``, and CPython leaves an inherited ``SIG_IGN`` alone -- it installs
+    ``default_int_handler`` only over the inherited *default*. Observed on a
+    live supervised run, 2026-09-09: ``signal.getsignal(SIGINT)`` was
+    ``signal.SIG_IGN`` and ``kill -INT`` was swallowed outright, so there was no
+    graceful way to stop a 30-minute hold. The obvious next thing to reach for
+    is worse: the default SIGTERM disposition kills the process WITHOUT
+    unwinding, so the ``finally`` that calls ``relay.safe()`` never runs and the
+    PLC is left with C1 (PID Auto) ENABLED and the bath holding whatever setpoint
+    it last received.
+
+    So both signals are pointed at the one path that is already correct.
+    ``_hold``'s ``except KeyboardInterrupt`` returns ABORTED and the outer
+    ``finally`` writes the safe setpoint and drives C1 False -- the same thing
+    an operator's Ctrl-C has always done.
+
+    Main thread only: ``signal.signal`` raises ``ValueError`` anywhere else, and
+    a run driven from a worker thread should still run rather than refuse. A
+    handler that cannot be installed is skipped for the same reason -- the run
+    is still bounded by ``--duration``.
+    """
+    previous: dict = {}
+    if threading.current_thread() is not threading.main_thread():
+        return previous
+    for signum, handler in ((signal.SIGINT, signal.default_int_handler),
+                            (signal.SIGTERM, _stop_on_signal)):
+        try:
+            previous[signum] = signal.signal(signum, handler)
+        except (OSError, ValueError):
+            continue
+    return previous
+
+
+def _restore_stop_handlers(previous: dict) -> None:
+    """Put back exactly what :func:`_install_operator_stop_handlers` replaced."""
+    for signum, handler in previous.items():
+        try:
+            signal.signal(signum, handler)
+        except (OSError, ValueError):
+            continue
+
+
+def _controller_block(record_run: runs.Run, started_unix_s: float) -> dict:
+    """Who is holding the chamber, for the dashboard's own header.
+
+    ``valve_mode``/``valve_note`` are reported as facts about what this
+    controller can do, not as a valve state: see :data:`VALVE_NOTE`.
+    """
+    return {
+        "pid": os.getpid(),
+        "run_dir": str(record_run.path),
+        "started_unix_s": float(started_unix_s),
+        "valve_mode": VALVE_MODE,
+        "valve_note": VALVE_NOTE,
+    }
+
+
+def _reading_of(record: env.RelayRecord) -> env.EnvironmentReading:
+    """Re-decode the reading the relay just acted on, out of its own record.
+
+    ``RelayRecord`` carries the reading as a dict and ``publish_last_reading``
+    takes the object, so one of them has to give. Re-decoding is the cheap side:
+    ``raw_registers`` is kept in the record for exactly this ("any channel can
+    be re-decoded later from the record without going back to the PLC" --
+    ``tools/environment/reading.py``), and ``PlcClient.read_block`` builds a
+    FAILED read the same way, as ``decode_block(())``, so the round trip is
+    exact on that path too.
+
+    The alternative -- a second ``read_block()`` per period -- costs one of the
+    CLICK's three Modbus sockets on every iteration AND publishes a different
+    read than the one the loop actually forwarded. That second problem is the
+    real one: the dashboard would be showing a reading no decision was made on.
+    """
+    reading = record.reading
+    return env.decode_block(reading.get("raw_registers", ()),
+                            t_utc=record.t_utc, monotonic_s=record.monotonic_s,
+                            pid_enabled=reading.get("pid_enabled"))
+
+
+def _publish(client: env.PlcClient, record_run: runs.Run, started_unix_s: float,
+             reading: env.EnvironmentReading, last_command: dict | None) -> None:
+    """Put this iteration's reading where the dashboard reads it.
+
+    THE LOOP HAS TO DO THIS, AND UNTIL 2026-09-09 NOTHING DID.
+    ``publish_last_reading`` was called only by the read helpers in
+    ``tools/environment/api.py`` and by the node's own read -- so during a
+    supervised run, the one time the dashboard *cannot* open a Modbus session of
+    its own (this process holds the ``environment`` claim, and the CLICK has
+    three sockets), the panel rendered whatever was left over from the last
+    manual read. A 30-minute hold showed a 30-minute-old chamber and no way to
+    tell.
+
+    Never fatal. A full disk or a vanished publish directory is logged and the
+    hold continues: the run's own record under ``dataset/`` is the authority and
+    the published file is a projection of it, so losing the projection is not a
+    reason to stop controlling a chamber.
+    """
+    try:
+        client.publish_last_reading(
+            reading,
+            extra={"controller": _controller_block(record_run, started_unix_s),
+                   "last_command": last_command})
+    except (OSError, env.SafetyError) as exc:
+        record_run.log("publish_last_reading failed (%s: %s); the dashboard will "
+                       "keep showing the previous reading"
+                       % (type(exc).__name__, exc), device=DEVICE, level="warn")
+
+
+def _apply_setpoint(cmd: env.Command, client: env.PlcClient,
+                    args: argparse.Namespace, record_run: runs.Run,
+                    limiter: env.RateLimiter,
+                    history: dict[str, tuple[float, float]],
+                    live: bool) -> tuple[str, str]:
+    """Write the setpoint(s) a command asked for, through the CLI's own path.
+
+    The bound and the FC16-with-read-back come from ``set_temperature`` /
+    ``set_humidity`` -- literally the functions ``--temp-sp`` and ``--rh-sp``
+    call, reached through :data:`SETPOINT_WRITERS` so the two paths cannot
+    diverge.
+
+    The rate limiter is applied HERE because it has to be:
+    ``tools/environment/api.py`` says so outright -- it needs the previous
+    write's value and time, which a stateless one-shot helper does not have, and
+    inventing "no previous write" on every call would make the interval rule
+    vacuous while looking enforced. ``history`` is that memory, shared with the
+    ``--temp-sp``/``--rh-sp`` writes at the start of the run.
+
+    BOTH keys of a two-key command are bounded and rate-checked before EITHER
+    reaches the wire. Otherwise a command whose second value is out of range
+    leaves the first one written and still reports refused, and the run record
+    then disagrees with the chamber -- which is the failure this whole layer is
+    built to avoid.
+    """
+    now = time.time()
+    planned = []
+    for key, flag, field, _attr, setter in SETPOINT_WRITERS:
+        if key not in cmd.args:
+            continue
+        value = float(cmd.args[key])
+        # The same SetpointLimits.validate the writer re-applies at the sink,
+        # called early only so a refusal cannot half-apply a two-key command.
+        # The token it returns is deliberately discarded: this is the check, not
+        # the write.
+        client.settings.limits.validate(field, value)
+        last_value, last_time = history.get(field, (None, None))
+        limiter.check(field, value, now=now, last_value=last_value,
+                      last_time=last_time)
+        planned.append((flag, field, setter, value))
+
+    outcomes: list[str] = []
+    details: list[str] = []
+    for flag, field, setter, value in planned:
+        result = setter(value, args.config, client=client, dry_run=not live)
+        record_run.record(DEVICE, "setpoint_writes", result.as_dict())
+        if result.outcome == env.CONFIRMED:
+            history[field] = (value, time.time())
+        outcomes.append(result.outcome)
+        details.append("%s %s" % (flag, result.describe()))
+
+    detail = " | ".join(details)
+    # A two-key command reports BOTH halves either way, and the worst outcome
+    # wins: "one of them failed" must not be summarised as confirmed.
+    if env.FAILED in outcomes:
+        return env.channel.OUTCOME_FAILED, detail
+    if outcomes and all(outcome == env.CONFIRMED for outcome in outcomes):
+        return env.channel.OUTCOME_CONFIRMED, detail
+    return env.channel.OUTCOME_PLANNED, detail
+
+
+def _apply_pid(cmd: env.Command, client: env.PlcClient, relay: env.Relay | None,
+               live: bool) -> tuple[str, str]:
+    """Turn the PLC's PID loop on or off. Off is always allowed; on is not.
+
+    Disabling is the safe direction and ``PlcClient.set_pid`` permits it with
+    ``allow_actuation`` false, so a dashboard that may not write a setpoint is
+    still a dashboard that can stop the loop.
+
+    ENABLING is refused while the relay is latched in safe mode. The latch means
+    the pre-declared fail-safe has already executed -- the safe setpoint is on
+    the bath and C1 is off -- and re-closing the loop from a dashboard button
+    would resume control across a link the watchdog just declared unusable. The
+    relay refuses to rearm itself for that reason (F1); this refuses for the
+    same one. A run is restarted instead, deliberately, by a person.
+    """
+    if not cmd.args["enabled"]:
+        result = client.set_pid(False, dry_run=not live)
+    elif relay is not None and relay.safe_mode:
+        return env.channel.OUTCOME_REFUSED, ("relay is latched in safe mode; "
+                                             "restart the run to re-arm")
+    else:
+        result = client.set_pid(True, dry_run=not live)
+    return result.outcome, result.describe()
+
+
+def _dispatch(cmd: env.Command, client: env.PlcClient, relay: env.Relay | None,
+              args: argparse.Namespace, record_run: runs.Run,
+              limiter: env.RateLimiter,
+              history: dict[str, tuple[float, float]],
+              live: bool) -> tuple[str, str]:
+    """Apply one shape-validated command. Returns ``(outcome, detail)``.
+
+    REFUSED and FAILED are told apart deliberately. Refused means a bound, a
+    gate, or a rate limit turned the command down -- a guard did its job, and
+    the operator needs to see which one. Failed means it was attempted and did
+    not verify, which is a different conversation and a different next step.
+    """
+    try:
+        if cmd.name == "setpoint":
+            return _apply_setpoint(cmd, client, args, record_run, limiter,
+                                   history, live)
+        if cmd.name == "pid":
+            return _apply_pid(cmd, client, relay, live)
+        # "valve" -- always refused; see VALVE_NOTE. Refused out loud rather
+        # than accepted and ignored, because a control that reports success
+        # while doing nothing is how an operator comes to believe a valve moved.
+        return env.channel.OUTCOME_REFUSED, VALVE_NOTE
+    except (env.SafetyError, ValueError) as exc:
+        # env.SafetyError covers RateLimited and ActuationNotAllowed, both
+        # subclasses of it; ValueError covers channel.ChannelError (a subclass)
+        # and a malformed float. All of them are a guard refusing.
+        return env.channel.OUTCOME_REFUSED, "%s: %s" % (type(exc).__name__, exc)
+    except Exception as exc:                                        # noqa: BLE001
+        return env.channel.OUTCOME_FAILED, "%s: %s" % (type(exc).__name__, exc)
+
+
+def _take_command(client: env.PlcClient, relay: env.Relay | None,
+                  args: argparse.Namespace, record_run: runs.Run,
+                  limiter: env.RateLimiter,
+                  history: dict[str, tuple[float, float]],
+                  live: bool) -> dict | None:
+    """Consume at most one dashboard command, apply it, and return its record.
+
+    ``None`` means nothing was pending. Otherwise the return value is the
+    ``last_command`` block the caller publishes; the contract for it is in
+    :mod:`tools.environment.channel`.
+
+    NOTHING A COMMAND DOES MAY END THE HOLD. A bad value, a shut gate, a
+    rate-limit refusal, a stale intent, even a hand-written ``command.json``
+    that is not valid JSON: each becomes an outcome and the loop comes round
+    again. ``BaseException`` is deliberately not caught -- the operator's stop
+    signal arrives as a KeyboardInterrupt and must still stop the run.
+    """
+    try:
+        cmd = env.channel.take()
+    except (env.channel.ChannelError, OSError) as exc:
+        # take() raises BEFORE it unlinks, so an unreadable command.json would
+        # be re-read and re-refused every period for the rest of the run.
+        # Remove it: nothing in this channel is ever replayed, and the
+        # dashboard's next write replaces the file anyway.
+        poison = env.channel.channel_dir() / env.channel.COMMAND_NAME
+        try:
+            poison.unlink()
+        except OSError:
+            pass
+        # log() echoes to stdout by default, so the operator sees this without a
+        # second print -- which would put the same refusal on the console twice.
+        record_run.log("REFUSED an unreadable dashboard command: %s" % exc,
+                       device=DEVICE, level="warn")
+        # Reported with seq and name unknown rather than through
+        # outcome_record(): there is no Command to build one from, and claiming
+        # a seq we could not read would be worse than saying we could not.
+        record = {"seq": None, "issued_unix_s": None, "name": "UNREADABLE",
+                  "args": {}, "source": "unknown",
+                  "outcome": env.channel.OUTCOME_REFUSED, "detail": str(exc),
+                  "finished_unix_s": time.time()}
+        record_run.record(DEVICE, "commands", record)
+        return record
+    if cmd is None:
+        return None
+
+    if env.channel.is_stale(cmd):
+        # Never applied, and reported as its own outcome rather than as a
+        # refusal: a queued intent must not fire after a restart or a long
+        # stall, and the operator should see that it expired rather than that
+        # something rejected it.
+        outcome = env.channel.OUTCOME_STALE
+        detail = ("issued %.1f s ago, past channel.STALE_AFTER_S=%g; NOT applied"
+                  % (time.time() - cmd.issued_unix_s, env.channel.STALE_AFTER_S))
+    else:
+        outcome, detail = _dispatch(cmd, client, relay, args, record_run,
+                                    limiter, history, live)
+
+    record = env.channel.outcome_record(cmd, outcome, detail)
+    record_run.record(DEVICE, "commands", record)
+    # One line, logged once: Run.log echoes to stdout itself.
+    record_run.log("command %s#%d %r -> %s: %s"
+                   % (cmd.name, cmd.seq, cmd.args, outcome, detail),
+                   device=DEVICE)
+    return record
+
+
 def run(args: argparse.Namespace, *, _plc_transport: object = None,
         _circ_transport: object = None) -> int:
     """Hold the chamber, relaying DF9 to the bath.
@@ -233,6 +571,10 @@ def run(args: argparse.Namespace, *, _plc_transport: object = None,
     the circulator's port (opening that port resets the MCU). Both default to
     ``None`` -- the real ``main()`` path builds real clients.
     """
+    # Wall time, not monotonic: it is published for the dashboard to render as
+    # "holding since", and a monotonic value means nothing in another process.
+    started_unix_s = time.time()
+
     if args.duration <= 0.0:
         print("--duration must be positive", file=sys.stderr)
         return 2
@@ -270,6 +612,14 @@ def run(args: argparse.Namespace, *, _plc_transport: object = None,
 
     live = bool(args.execute)
     devices = (DEVICE,) if args.no_relay else (DEVICE, BATH)
+
+    # The rate limiter is THIS SCRIPT's, per tools/environment/api.py, and it is
+    # stateful: `history` maps a field to the (value, unix time) of its last
+    # CONFIRMED write. It spans the --temp-sp/--rh-sp writes below AND every
+    # dashboard setpoint command the loop consumes, so the step and interval
+    # caps mean something across both instead of resetting per caller.
+    limiter = plc_settings.rate_limiter
+    history: dict[str, tuple[float, float]] = {}
 
     # NOT the `with` form here, deliberately. Run.__exit__ stamps STATUS_OK
     # whenever no exception escaped, and this script's failures are RETURNED
@@ -321,6 +671,7 @@ def run(args: argparse.Namespace, *, _plc_transport: object = None,
             # folder in a run that never touched the bath is a misleading record.
             record_run.log(bath_settings.describe(), device=BATH)
         record_run.log(policy.describe(), device=DEVICE)
+        record_run.log(limiter.describe(), device=DEVICE)
         record_run.log(env.provenance(), device=DEVICE)
         print(policy.describe())
         print()
@@ -348,13 +699,20 @@ def run(args: argparse.Namespace, *, _plc_transport: object = None,
                 bath_device = circ.Circulator(
                     bath_settings, _circ_transport, log=record_run.logger(BATH))
                 relay = env.Relay(client, bath_device, policy)
+            # Live path only, and only now that the interlock above exists: from
+            # here on a stop signal raises KeyboardInterrupt, which reaches the
+            # `finally` below and disables the PID. Restored there too, so a
+            # caller that drives run() twice in one process is not left holding
+            # this run's handlers.
+            stop_handlers = _install_operator_stop_handlers() if live else {}
             try:
                 opened = client.connect()
                 record_run.log("connect -> %r (last_error=%r)"
                                % (opened, client.last_error), device=DEVICE)
 
                 # (1) setpoints -- the first actuating step in a live run.
-                if not _write_setpoints(args, client, record_run, live):
+                if not _write_setpoints(args, client, record_run, live,
+                                        history):
                     record_run.note("a setpoint write was not confirmed; the "
                                     "hold loop ran anyway, so the PLC may have "
                                     "been holding a different setpoint than "
@@ -406,9 +764,18 @@ def run(args: argparse.Namespace, *, _plc_transport: object = None,
                 # (5) the loop.
                 if args.no_relay:
                     deadline = time.monotonic() + args.duration
+                    last_command: dict | None = None
                     while time.monotonic() < deadline:
+                        # Dashboard commands are honoured here too: --no-relay
+                        # drops the forward to the bath, not the supervisor.
+                        outcome = _take_command(client, None, args, record_run,
+                                                limiter, history, live)
+                        if outcome is not None:
+                            last_command = outcome
                         reading = client.read_block()
                         record_run.record(DEVICE, "readings", reading.as_dict())
+                        _publish(client, record_run, started_unix_s, reading,
+                                 last_command)
                         print("read_ok=%r partial=%r temp=%r rh=%r pid=%r"
                               % (reading.read_ok, reading.partial,
                                  reading.temp_filtered_c, reading.rh_filtered_pct,
@@ -416,8 +783,11 @@ def run(args: argparse.Namespace, *, _plc_transport: object = None,
                         time.sleep(period)
                 else:
                     forwarded, refused, exit_code, status = _hold(
-                        relay, record_run, args, period, exit_code)
+                        relay, record_run, args, period, exit_code,
+                        client=client, started_unix_s=started_unix_s,
+                        live=live, limiter=limiter, history=history)
             finally:
+                _restore_stop_handlers(stop_handlers)
                 # The one real interlock, and it runs on every path: safe
                 # setpoint written, C1 driven False in safe()'s own finally.
                 if relay is not None:
@@ -455,18 +825,41 @@ def run(args: argparse.Namespace, *, _plc_transport: object = None,
 
 
 def _hold(relay: env.Relay, record_run: runs.Run, args: argparse.Namespace,
-          period: float, exit_code: int) -> tuple[int, int, int, str]:
+          period: float, exit_code: int, *, client: env.PlcClient,
+          started_unix_s: float, live: bool, limiter: env.RateLimiter,
+          history: dict[str, tuple[float, float]]) -> tuple[int, int, int, str]:
     """The loop. Returns ``(forwarded, refused, exit_code, status)``.
 
     Every decision in here is this file's: one `step()` per period, no immediate
     retry, no re-send of a stale value, and `--stop-on-stale` deciding what
     happens after a watchdog has already executed the fail-safe.
+
+    Three things happen per period, in this order and for these reasons:
+
+    1. **One pending dashboard command is consumed, BEFORE the step.** So a
+       setpoint the operator just changed is on the PLC before the reading this
+       iteration publishes -- otherwise the panel would show the old setpoint
+       for a full period after acknowledging the command, which reads as the
+       command having been lost.
+    2. **`relay.step()`** -- one read, one forward or one refusal.
+    3. **The reading is published**, with who is holding the chamber and what
+       became of the last command. This is the only thing that keeps the
+       dashboard current during a run: it cannot open a Modbus session of its
+       own while this process holds the `environment` claim.
     """
     forwarded = refused = 0
     status = runs.STATUS_OK
+    #: The most recent command's outcome record, republished every iteration
+    #: until another command replaces it, so the panel keeps showing what
+    #: happened rather than blanking a second later. `None` until one arrives.
+    last_command: dict | None = None
     deadline = time.monotonic() + args.duration
     try:
         while time.monotonic() < deadline:
+            outcome = _take_command(client, relay, args, record_run, limiter,
+                                    history, live)
+            if outcome is not None:
+                last_command = outcome
             try:
                 record = relay.step()
             except env.CommsLost as exc:
@@ -481,6 +874,11 @@ def _hold(relay: env.Relay, record_run: runs.Run, args: argparse.Namespace,
                 attached = getattr(exc, "record", None)
                 if attached is not None:
                     record_run.record(DEVICE, "relay", attached.as_dict())
+                    # Published as well: a watchdog firing is exactly when the
+                    # operator is looking at the panel, and safe_mode reaching
+                    # it a period late is a period spent wondering.
+                    _publish(client, record_run, started_unix_s,
+                             _reading_of(attached), last_command)
                 if isinstance(exc, env.FailSafeIncomplete):
                     record_run.note("FAIL-SAFE INCOMPLETE: the watchdog fired but "
                                     "the safe setpoint and/or PID disable were not "
@@ -523,6 +921,8 @@ def _hold(relay: env.Relay, record_run: runs.Run, args: argparse.Namespace,
                 return forwarded, refused + 1, 2, runs.STATUS_FAILED
 
             record_run.record(DEVICE, "relay", record.as_dict())
+            _publish(client, record_run, started_unix_s, _reading_of(record),
+                     last_command)
             if record.forwarded:
                 forwarded += 1
             else:
